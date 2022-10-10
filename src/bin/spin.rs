@@ -43,10 +43,10 @@ enum SpinApp {
     #[clap(subcommand)]
     Bindle(BindleCommands),
     // Deploy(DeployCommand),
-    CloudDeploy(DeployCommand),
+    Deploy(DeployCommand),
     Build(BuildCommand),
     // Login(LoginCommand),
-    CloudLogin(Login),
+    Login(Login),
     #[clap(subcommand)]
     Plugin(PluginCommands),
     #[clap(subcommand, hide = true)]
@@ -69,12 +69,12 @@ impl SpinApp {
             Self::Up(cmd) => cmd.run().await,
             Self::New(cmd) => cmd.run().await,
             Self::Bindle(cmd) => cmd.run().await,
-            Self::CloudDeploy(cmd) => cmd.run().await,
+            Self::Deploy(cmd) => cmd.run().await,
             Self::Build(cmd) => cmd.run().await,
             Self::Trigger(TriggerCommands::Http(cmd)) => cmd.run().await,
             Self::Trigger(TriggerCommands::Redis(cmd)) => cmd.run().await,
             // Self::Login(cmd) => cmd.run().await,
-            Self::CloudLogin(cmd) => cmd.run().await,
+            Self::Login(cmd) => cmd.run().await,
             Self::Plugin(cmd) => cmd.run().await,
             Self::External(cmd) => execute_external_subcommand(cmd, SpinApp::command()).await,
         }
