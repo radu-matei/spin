@@ -11,5 +11,5 @@ fn hello_world(req: Request) -> Result<Response> {
     Ok(http::Response::builder()
         .status(200)
         .header("foo", "bar")
-        .body(Some("Hello, Fermyon!\n".into()))?)
+        .body(Some("HOW ABOUT DEV UPDATES?".into()))?)
 }

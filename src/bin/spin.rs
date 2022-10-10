@@ -2,9 +2,9 @@ use anyhow::Error;
 use clap::{CommandFactory, Parser, Subcommand};
 use lazy_static::lazy_static;
 use spin_cli::commands::{
-    bindle::BindleCommands, build::BuildCommand, deploy::DeployCommand,
-    external::execute_external_subcommand, login::LoginCommand, new::NewCommand,
-    plugins::PluginCommands, templates::TemplateCommands, up::UpCommand,
+    bindle::BindleCommands, build::BuildCommand, cloud_deploy::DeployCommand, cloud_login::Login,
+    external::execute_external_subcommand, new::NewCommand, plugins::PluginCommands,
+    templates::TemplateCommands, up::UpCommand,
 };
 use spin_http::HttpTrigger;
 use spin_redis_engine::RedisTrigger;
@@ -42,9 +42,11 @@ enum SpinApp {
     Up(UpCommand),
     #[clap(subcommand)]
     Bindle(BindleCommands),
-    Deploy(DeployCommand),
+    // Deploy(DeployCommand),
+    CloudDeploy(DeployCommand),
     Build(BuildCommand),
-    Login(LoginCommand),
+    // Login(LoginCommand),
+    CloudLogin(Login),
     #[clap(subcommand)]
     Plugin(PluginCommands),
     #[clap(subcommand, hide = true)]
@@ -67,11 +69,12 @@ impl SpinApp {
             Self::Up(cmd) => cmd.run().await,
             Self::New(cmd) => cmd.run().await,
             Self::Bindle(cmd) => cmd.run().await,
-            Self::Deploy(cmd) => cmd.run().await,
+            Self::CloudDeploy(cmd) => cmd.run().await,
             Self::Build(cmd) => cmd.run().await,
             Self::Trigger(TriggerCommands::Http(cmd)) => cmd.run().await,
             Self::Trigger(TriggerCommands::Redis(cmd)) => cmd.run().await,
-            Self::Login(cmd) => cmd.run().await,
+            // Self::Login(cmd) => cmd.run().await,
+            Self::CloudLogin(cmd) => cmd.run().await,
             Self::Plugin(cmd) => cmd.run().await,
             Self::External(cmd) => execute_external_subcommand(cmd, SpinApp::command()).await,
         }

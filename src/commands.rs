@@ -4,12 +4,16 @@
 pub mod bindle;
 /// Commands for building Spin applications.
 pub mod build;
+/// WIP reimplementation for deploy command.
+pub mod cloud_deploy;
+/// WIP reimplementation for login command.
+pub mod cloud_login;
 /// Command for deploying a Spin app to Hippo
-pub mod deploy;
+// pub mod deploy;
 /// Commands for external subcommands (i.e. plugins)
 pub mod external;
 // Command for logging into the server
-pub mod login;
+// pub mod login;
 /// Command for creating a new application.
 pub mod new;
 /// Command for adding a plugin to Spin

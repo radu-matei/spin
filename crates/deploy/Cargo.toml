@@ -1,0 +1,25 @@
+[package]
+name = "spin-deploy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+bindle = { git = "https://github.com/fermyon/bindle", tag = "v0.8.1", default-features = false, features = ["client"] }
+chrono = "0.4"
+cloud-openapi = { git = "https://github.com/fermyon/cloud-openapi" }
+dirs = "4.0"
+hippo-openapi = "0.10"
+hippo = { git = "https://github.com/deislabs/hippo-cli", tag = "v0.16.1" }
+reqwest = { version = "0.11", features = ["stream"] }
+semver = "1.0"
+serde = { version = "1.0", features = [ "derive" ] }
+serde_json = "1.0.82"
+spin-loader = { path = "../loader" }
+spin-publish = { path = "../publish" }
+thiserror = "1"
+tokio = { version = "1.11", features = [ "full" ] }
+tracing = { version = "0.1", features = [ "log" ] }
+tempfile = "3.3.0"
+uuid = "^1.0"

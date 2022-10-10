@@ -1,0 +1,10 @@
+{
+  "ProxiedRegistry": {
+    "url": "https://canary.platform.fermyon.link",
+    "token_info": {
+      "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI1YjI1MzBmZC04NjRiLTRlNDItOGVlNi03YTc5OTUzY2YwMDQiLCJ1bmlxdWVfbmFtZSI6IjViMjUzMGZkLTg2NGItNGU0Mi04ZWU2LTdhNzk5NTNjZjAwNCIsImp0aSI6ImFkNjM5NDkyLWQ2MDctNDcxOS04YjU3LTlmZTAwMzA4ZjhlOCIsImh0dHA6Ly9zY2hlbWFzLnhtbHNvYXAub3JnL3dzLzIwMDUvMDUvaWRlbnRpdHkvY2xhaW1zL25hbWVpZGVudGlmaWVyIjoiNWIyNTMwZmQtODY0Yi00ZTQyLThlZTYtN2E3OTk1M2NmMDA0IiwiaHR0cDovL3NjaGVtYXMubWljcm9zb2Z0LmNvbS93cy8yMDA4LzA2L2lkZW50aXR5L2NsYWltcy9yb2xlIjoiRnJlZVRpZXIiLCJleHAiOjE2NjU5ODI4MzcsImlzcyI6ImNhbmFyeS5wbGF0Zm9ybS5mZXJteW9uLmxpbmsiLCJhdWQiOiJjYW5hcnkucGxhdGZvcm0uZmVybXlvbi5saW5rIn0.61XHHGcd_ksETPI5kh3jR3odga9SkaHY7CTYUZy9Fi4",
+      "expiration": "2022-10-17T05:00:37Z"
+    },
+    "insecure": false
+  }
+}

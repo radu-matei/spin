@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use cloud::client::{Client, ConnectionConfig};
 use cloud_openapi::models::DeviceCodeItem;
 use cloud_openapi::models::TokenInfo;
 use hippo::Client as HippoClient;
@@ -12,6 +11,7 @@ use hippo::ConnectionInfo;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
+use spin_deploy::clients::cloud::Client;
 use tokio::fs;
 use tracing::log;
 use uuid::Uuid;
@@ -73,9 +73,10 @@ pub struct LoginCommand {
         name = HIPPO_SERVER_URL_OPT,
         long = "hippo-server",
         env = HIPPO_URL_ENV,
-        requires = BINDLE_SERVER_URL_OPT,
-        requires = HIPPO_USERNAME,
-        requires = HIPPO_PASSWORD,
+        // TODO: the URL should not require other options
+        // requires = BINDLE_SERVER_URL_OPT,
+        // requires = HIPPO_USERNAME,
+        // requires = HIPPO_PASSWORD,
     )]
     pub hippo_server_url: Option<String>,
 
@@ -287,10 +288,24 @@ async fn github_token(
             bail!("Timed out waiting to authorize the device. Please execute `spin login` again and authorize the device with GitHub.");
         }
 
-        match client.login(device_code.device_code.clone().unwrap()).await {
+        match client
+            .login(
+                device_code
+                    .device_code
+                    .clone()
+                    .context("cannot get device code")?,
+            )
+            .await
+        {
             Ok(response) => {
-                println!("Device authorized!");
-                return Ok(response);
+                if response.token != None {
+                    println!("Device authorized!");
+                    return Ok(response);
+                }
+                println!("Waiting for device authorization...");
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                seconds_elapsed += 1;
+                continue;
             }
             Err(_) => {
                 println!("Waiting for device authorization...");
