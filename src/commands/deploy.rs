@@ -569,7 +569,7 @@ impl DeployCommand {
             Some(path) => path.as_path(),
         };
 
-        let bindle_id = spin_publish::prepare_bindle(&self.app, buildinfo, dest_dir)
+        let bindle_id = spin_publish::bindle::prepare_bindle(&self.app, buildinfo, dest_dir)
             .await
             .map_err(crate::wrap_prepare_bindle_error)?;
 
@@ -579,8 +579,10 @@ impl DeployCommand {
             bindle_id.version()
         );
 
-        match spin_publish::push_all(dest_dir, &bindle_id, bindle_connection_info.clone()).await {
-            Err(spin_publish::PublishError::BindleAlreadyExists(err_msg)) => {
+        match spin_publish::bindle::push_all(dest_dir, &bindle_id, bindle_connection_info.clone())
+            .await
+        {
+            Err(spin_publish::bindle::PublishError::BindleAlreadyExists(err_msg)) => {
                 if self.redeploy {
                     Ok(bindle_id.clone())
                 } else {

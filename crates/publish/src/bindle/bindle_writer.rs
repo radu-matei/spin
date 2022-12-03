@@ -1,6 +1,6 @@
 #![deny(missing_docs)]
 
-use crate::{expander::expand_manifest, PublishError, PublishResult};
+use crate::bindle::{expander::expand_manifest, PublishError, PublishResult};
 use bindle::{Invoice, Parcel};
 use spin_loader::local::parent_dir;
 use std::{
