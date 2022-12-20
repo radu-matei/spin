@@ -11,6 +11,7 @@ clap = { version = "3.1.15", features = ["derive", "env"] }
 ctrlc = { version = "3.2", features = ["termination"] }
 dirs = "4"
 futures = "0.3"
+oci-distribution = { git = "https://github.com/radu-matei/oci-distribution", branch = "update-dockerhub-default-registry" }
 outbound-http = { path = "../outbound-http" }
 outbound-redis = { path = "../outbound-redis" }
 outbound-pg = { path = "../outbound-pg" }
@@ -23,7 +24,8 @@ spin-config = { path = "../config" }
 spin-core = { path = "../core" }
 spin-loader = { path = "../loader" }
 spin-manifest = { path = "../manifest" }
-tokio = { version = "1.11", features = [ "full" ] }
+tempfile = "3.3.0"
+tokio = { version = "1.23", features = ["full"] }
 toml = "0.5.9"
 tracing = { workspace = true }
 url = "2"

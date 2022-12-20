@@ -125,6 +125,15 @@ checksum = "d468802bab17cbc0cc575e9b053f41e72aa36bfa6b7f55e3529ffa43161b97fa"
 
 [[package]]
 name = "base64"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b25d992356d2eb0ed82172f5248873db5560c4721f564b13cb5193bda5e668e"
+dependencies = [
+ "byteorder",
+]
+
+[[package]]
+name = "base64"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "904dfeac50f3cdaba28fc6f57fdcddb75f49ed61346676a78c4ffe55877802fd"
@@ -135,7 +144,7 @@ version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f691e63585950d8c1c43644d11bab9073e40f5060dd2822734ae7c3dc69a3a80"
 dependencies = [
- "base64",
+ "base64 0.13.0",
  "blowfish",
  "getrandom 0.2.7",
 ]
@@ -187,7 +196,7 @@ dependencies = [
  "anyhow",
  "async-compression",
  "async-trait",
- "base64",
+ "base64 0.13.0",
  "bcrypt",
  "bytes",
  "dirs 4.0.0",
@@ -215,7 +224,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tar",
  "tokio-util 0.6.10",
- "toml",
+ "toml 0.5.9",
  "tracing",
  "tracing-futures",
  "url",
@@ -1204,6 +1213,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fea41bba32d969b513997752735605054bc0dfa92b4c56bf1189f2e174be7a10"
 
 [[package]]
+name = "docker_credential"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf2b7a539236f31eb8bcfa784affc137400cedbf1a73e0607acbb2f6306584e5"
+dependencies = [
+ "base64 0.10.1",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dotenvy"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1767,7 +1787,7 @@ dependencies = [
  "serde_json",
  "sha2 0.9.9",
  "tokio",
- "toml",
+ "toml 0.5.9",
  "uuid",
 ]
 
@@ -1803,6 +1823,15 @@ dependencies = [
  "bytes",
  "fnv",
  "itoa 1.0.4",
+]
+
+[[package]]
+name = "http-auth"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0b40b39d66c28829a0cf4d09f7e139ff8201f7500a5083732848ed3b4b4d850"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -2075,12 +2104,27 @@ version = "8.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa4b4af834c6cfd35d8763d359661b90f2e45d8f750a0849156c7f4671af09c"
 dependencies = [
- "base64",
+ "base64 0.13.0",
  "pem",
  "ring",
  "serde",
  "serde_json",
  "simple_asn1",
+]
+
+[[package]]
+name = "jwt"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6204285f77fe7d9784db3fdc449ecce1a0114927a51d5a41c4c7a292011c015f"
+dependencies = [
+ "base64 0.13.0",
+ "crypto-common",
+ "digest 0.10.5",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2 0.10.6",
 ]
 
 [[package]]
@@ -2552,6 +2596,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nom8"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae01545c9c7fc4486ab7debaf2aad7003ac19431791868fb2e8066df97fad2f8"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2616,7 +2669,7 @@ version = "4.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d62c436394991641b970a92e23e8eeb4eb9bca74af4f5badc53bcd568daadbd"
 dependencies = [
- "base64",
+ "base64 0.13.0",
  "chrono",
  "getrandom 0.2.7",
  "http",
@@ -2640,6 +2693,39 @@ dependencies = [
  "hashbrown 0.12.3",
  "indexmap",
  "memchr",
+]
+
+[[package]]
+name = "oci-distribution"
+version = "0.9.3"
+source = "git+https://github.com/radu-matei/oci-distribution?branch=update-dockerhub-default-registry#f2cdd28637609009ee565b9410fc0b6eaa83e822"
+dependencies = [
+ "futures-util",
+ "http",
+ "http-auth",
+ "jwt",
+ "lazy_static",
+ "olpc-cjson",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.6",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "unicase",
+]
+
+[[package]]
+name = "olpc-cjson"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87dc75cf72208cd853671c1abccc5d5d1e43b1e378dde67340ef933219a8c13c"
+dependencies = [
+ "serde",
+ "serde_json",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -2881,7 +2967,7 @@ version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03c64931a1a212348ec4f3b4362585eca7159d0d09cbdf4a7f74f02173596fd4"
 dependencies = [
- "base64",
+ "base64 0.13.0",
 ]
 
 [[package]]
@@ -3024,7 +3110,7 @@ version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "878c6cbf956e03af9aa8204b407b9cbf47c072164800aa918c516cd4b056c50c"
 dependencies = [
- "base64",
+ "base64 0.13.0",
  "byteorder",
  "bytes",
  "fallible-iterator",
@@ -3059,7 +3145,7 @@ version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d6ea3c4595b96363c13943497db34af4460fb474a95c43f4446ad341b8c9785"
 dependencies = [
- "toml",
+ "toml 0.5.9",
 ]
 
 [[package]]
@@ -3379,7 +3465,7 @@ version = "0.11.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "431949c384f4e2ae07605ccaa56d1d9d2ecdb5cadd4f9577ccfab29f2e5149fc"
 dependencies = [
- "base64",
+ "base64 0.13.0",
  "bytes",
  "encoding_rs",
  "futures-core",
@@ -3579,7 +3665,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ee86d63972a7c661d1536fefe8c3c8407321c3df668891286de28abcd087360"
 dependencies = [
- "base64",
+ "base64 0.13.0",
 ]
 
 [[package]]
@@ -3588,7 +3674,7 @@ version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0864aeff53f8c05aa08d86e5ef839d3dfcf07aeba2db32f12db0ef716e87bd55"
 dependencies = [
- "base64",
+ "base64 0.13.0",
 ]
 
 [[package]]
@@ -3763,6 +3849,15 @@ name = "serde_path_to_error"
 version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "184c643044780f7ceb59104cef98a5a6f12cb2288a7bc701ab93a362b49fd47d"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "serde_spanned"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c68e921cef53841b8925c2abadd27c9b891d9613bdc43d6b823062866df38e8"
 dependencies = [
  "serde",
 ]
@@ -3984,7 +4079,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "toml",
+ "toml 0.5.9",
  "wasi-common",
  "wasmtime",
  "wasmtime-wasi",
@@ -4014,7 +4109,7 @@ dependencies = [
  "spin-loader",
  "subprocess",
  "tokio",
- "toml",
+ "toml 0.5.9",
  "tracing",
 ]
 
@@ -4067,7 +4162,7 @@ dependencies = [
  "spin-trigger",
  "tempfile",
  "tokio",
- "toml",
+ "toml 0.6.0",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -4090,7 +4185,7 @@ dependencies = [
  "spin-core",
  "thiserror",
  "tokio",
- "toml",
+ "toml 0.5.9",
  "vaultrs",
  "wit-bindgen-wasmtime",
 ]
@@ -4148,21 +4243,28 @@ dependencies = [
  "async-trait",
  "bindle",
  "bytes",
+ "dirs 4.0.0",
+ "dunce",
  "futures",
  "glob",
  "itertools",
  "lazy_static",
+ "mime_guess",
+ "oci-distribution",
  "outbound-http",
  "path-absolutize",
  "regex",
  "reqwest",
+ "semver 1.0.14",
  "serde",
+ "serde_json",
  "sha2 0.10.6",
  "spin-manifest",
  "tempfile",
+ "thiserror",
  "tokio",
  "tokio-util 0.6.10",
- "toml",
+ "toml 0.5.9",
  "tracing",
  "walkdir",
 ]
@@ -4218,20 +4320,29 @@ version = "0.7.1"
 dependencies = [
  "anyhow",
  "bindle",
+ "dirs 4.0.0",
+ "docker_credential",
  "dunce",
  "futures",
  "itertools",
  "lazy_static",
  "mime_guess",
+ "oci-distribution",
  "regex",
  "reqwest",
  "semver 1.0.14",
  "serde",
+ "serde_json",
+ "spin-app",
  "spin-loader",
  "spin-manifest",
+ "spin-trigger",
+ "tempfile",
  "thiserror",
  "tokio",
- "toml",
+ "toml 0.5.9",
+ "tracing",
+ "walkdir",
 ]
 
 [[package]]
@@ -4291,7 +4402,7 @@ dependencies = [
  "sha2 0.10.6",
  "tempfile",
  "tokio",
- "toml",
+ "toml 0.5.9",
  "url",
  "walkdir",
  "wasmtime",
@@ -4326,6 +4437,7 @@ dependencies = [
  "ctrlc",
  "dirs 4.0.0",
  "futures",
+ "oci-distribution",
  "outbound-http",
  "outbound-mysql",
  "outbound-pg",
@@ -4340,7 +4452,7 @@ dependencies = [
  "spin-manifest",
  "tempfile",
  "tokio",
- "toml",
+ "toml 0.5.9",
  "tracing",
  "url",
  "wasmtime",
@@ -4619,9 +4731,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.21.2"
+version = "1.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9e03c497dc955702ba729190dc4aac6f2a0ce97f913e5b1b5912fc5039d9099"
+checksum = "597a12a59981d9e3c38d216785b0c37399f6e415e8d0712047620f189371b0bb"
 dependencies = [
  "autocfg",
  "bytes",
@@ -4634,7 +4746,7 @@ dependencies = [
  "signal-hook-registry",
  "socket2",
  "tokio-macros",
- "winapi",
+ "windows-sys 0.42.0",
 ]
 
 [[package]]
@@ -4754,6 +4866,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d82e1a7758622a465f8cee077614c73484dac5b836c02ff6a40d5d1010324d7"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "toml"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fb9d890e4dc9298b70f740f615f2e05b9db37dce531f6b24fb77ac993f9f217"
+dependencies = [
+ "serde",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_edit",
+]
+
+[[package]]
+name = "toml_datetime"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4553f467ac8e3d374bc9a177a26801e5d0f9b211aa1673fb137a403afd1c9cf5"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "toml_edit"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "729bfd096e40da9c001f778f5cdecbd2957929a24e10e5883d9392220a751581"
+dependencies = [
+ "indexmap",
+ "nom8",
+ "serde",
+ "serde_spanned",
+ "toml_datetime",
 ]
 
 [[package]]
@@ -5223,7 +5369,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68f467d67ad8295d34de2840dde47e60ef83b88bce08f4bdb371503e8e1e5c55"
 dependencies = [
  "anyhow",
- "base64",
+ "base64 0.13.0",
  "bincode",
  "directories-next",
  "file-per-thread-logger",
@@ -5231,7 +5377,7 @@ dependencies = [
  "rustix 0.35.11",
  "serde",
  "sha2 0.10.6",
- "toml",
+ "toml 0.5.9",
  "windows-sys 0.36.1",
  "zstd",
 ]
