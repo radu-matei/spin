@@ -20,8 +20,10 @@ reqwest = "0.11"
 semver = "1.0"
 serde = { version = "1.0", features = [ "derive" ] }
 serde_json = "1.0"
+spin-app = { path = "../app" }
 spin-loader = { path = "../loader" }
 spin-manifest = { path = "../manifest" }
+spin-trigger = { path = "../trigger" }
 thiserror = "1.0.37"
 tokio = { version = "1.20", features = ["full"] }
 tracing = "0.1"
