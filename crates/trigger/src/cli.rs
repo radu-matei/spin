@@ -9,7 +9,7 @@ use tokio::{
 };
 
 use crate::{config::TriggerExecutorBuilderConfig, loader::TriggerLoader, stdio::FollowComponents};
-use crate::{loader::OciTriggerLoader, stdio::StdioLoggingTriggerHooks};
+use crate::{loader::RegistryTriggerLoader, stdio::StdioLoggingTriggerHooks};
 use crate::{TriggerExecutor, TriggerExecutorBuilder};
 
 pub const APP_LOG_DIR: &str = "APP_LOG_DIR";
@@ -89,8 +89,9 @@ where
     #[clap(long = "help-args-only", hide = true)]
     pub help_args_only: bool,
 
-    #[clap(long = "oci")]
-    pub oci: bool,
+    /// Load the application from the registry.
+    #[clap(long = "from-registry")]
+    pub from_registry: bool,
 }
 
 /// An empty implementation of clap::Args to be used as TriggerExecutor::RunConfig
@@ -119,10 +120,11 @@ where
 
         // TODO: I assume there is a way to do this with a single let mut loader: Box<dyn Loader>
         // variable instead of the entire executor.
-        let executor: Executor = match self.oci {
+        let executor: Executor = match self.from_registry {
             true => {
                 let loader =
-                    OciTriggerLoader::new(working_dir, self.allow_transient_write, None).await?;
+                    RegistryTriggerLoader::new(working_dir, self.allow_transient_write, None)
+                        .await?;
 
                 let trigger_config =
                     TriggerExecutorBuilderConfig::load_from_file(self.runtime_config_file.clone())?;

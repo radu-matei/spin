@@ -81,13 +81,13 @@ impl Loader for TriggerLoader {
     }
 }
 
-pub struct OciTriggerLoader {
+pub struct RegistryTriggerLoader {
     working_dir: PathBuf,
     allow_transient_write: bool,
     cache: Cache,
 }
 
-impl OciTriggerLoader {
+impl RegistryTriggerLoader {
     // TODO: support a different cache root directory
     pub async fn new(
         working_dir: impl Into<PathBuf>,
@@ -103,7 +103,7 @@ impl OciTriggerLoader {
 }
 
 #[async_trait]
-impl Loader for OciTriggerLoader {
+impl Loader for RegistryTriggerLoader {
     // Read the locked app from the OCI cache and update the module source for each
     // component with the path to the Wasm modules from the OCI cache.
     async fn load_app(&self, url: &str) -> Result<LockedApp> {

@@ -70,6 +70,16 @@ pub struct UpCommand {
     )]
     pub bindle_password: Option<String>,
 
+    /// Reference to run the application from a container registry.
+    #[clap(
+        name = REFERENCE,
+        long = "reference",
+        env = REFERENCE,
+        conflicts_with = BINDLE_ID_OPT,
+        conflicts_with = APP_CONFIG_FILE_OPT
+    )]
+    pub reference: Option<String>,
+
     /// Ignore server certificate errors from bindle server
     #[clap(
         name = INSECURE_OPT,
@@ -140,8 +150,8 @@ impl UpCommand {
         };
         let working_dir = working_dir_holder.path().canonicalize()?;
 
-        let mut app = match (&self.app, &self.bindle) {
-            (app, None) => {
+        let mut app = match (&self.app, &self.bindle, &self.reference) {
+            (app, None, None) => {
                 let manifest_file = app
                     .as_deref()
                     .unwrap_or_else(|| DEFAULT_MANIFEST_FILE.as_ref());
@@ -153,7 +163,7 @@ impl UpCommand {
                 };
                 spin_loader::from_file(manifest_file, asset_dst, &bindle_connection).await?
             }
-            (None, Some(bindle)) => match &self.server {
+            (None, Some(bindle), None) => match &self.server {
                 Some(server) => {
                     assert!(!self.direct_mounts);
 
@@ -161,8 +171,26 @@ impl UpCommand {
                 }
                 _ => bail!("Loading from a bindle requires a Bindle server URL"),
             },
-            (Some(_), Some(_)) => bail!("Specify only one of app file or bindle ID"),
+
+            (None, None, Some(reference)) => {
+                let mut client = spin_publish::oci::client::Client::new(self.insecure, None)
+                    .await
+                    .context("cannot create registry client")?;
+                client
+                    .pull(&reference)
+                    .await
+                    .context("cannot pull Spin application from registry")?;
+
+                todo!()
+            }
+
+            (Some(_), Some(_), Some(_)) => {
+                bail!("Specify only one of app file, bindle ID, or container registry reference")
+            }
+            _ => bail!(""),
         };
+
+        let from_registry = self.reference.is_some();
 
         // Apply --env to component environments
         if !self.env.is_empty() {
@@ -180,7 +208,11 @@ impl UpCommand {
         let exec_opts = if self.help {
             TriggerExecOpts::NoApp
         } else {
-            TriggerExecOpts::App { app, working_dir }
+            TriggerExecOpts::App {
+                app,
+                working_dir,
+                from_registry,
+            }
         };
 
         self.run_trigger(trigger_type, exec_opts)
@@ -200,11 +232,18 @@ impl UpCommand {
             TriggerExecOpts::NoApp => {
                 cmd.arg("--help-args-only");
             }
-            TriggerExecOpts::App { app, working_dir } => {
+            TriggerExecOpts::App {
+                app,
+                working_dir,
+                from_registry,
+            } => {
                 let locked_url = self.write_locked_app(app, &working_dir)?;
                 cmd.env(SPIN_LOCKED_URL, locked_url)
                     .env(SPIN_WORKING_DIR, &working_dir)
                     .args(&self.trigger_args);
+                if from_registry {
+                    cmd.arg("--from-registry");
+                }
             }
         }
 
@@ -325,6 +364,7 @@ enum TriggerExecOpts {
     App {
         app: spin_manifest::Application,
         working_dir: PathBuf,
+        from_registry: bool,
     },
 }
 
