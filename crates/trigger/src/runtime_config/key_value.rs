@@ -31,6 +31,8 @@ pub fn build_key_value_component(runtime_config: &RuntimeConfig) -> Result<KeyVa
 pub enum KeyValueStoreOpts {
     Spin(SpinKeyValueStoreOpts),
 
+    Redis(RedisKeyValueStoreOpts),
+
     // Temporary placeholder to prevent "irrefutable match" lints
     // TODO: Remove when adding second enum variant
     #[serde(skip)]
@@ -46,6 +48,7 @@ impl KeyValueStoreOpts {
     pub fn build_store(&self, config_opts: &RuntimeConfigOpts) -> Result<KeyValueStore> {
         match self {
             Self::Spin(opts) => opts.build_store(config_opts),
+            Self::Redis(opts) => opts.build_store(config_opts),
             Self::IrrefutableMatchSuppressionSystemDeleteMePlease => unreachable!(),
         }
     }
@@ -78,6 +81,20 @@ impl SpinKeyValueStoreOpts {
             None => DatabaseLocation::InMemory,
         };
         Ok(Arc::new(KeyValueSqlite::new(location)))
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedisKeyValueStoreOpts {
+    pub url: String,
+}
+
+impl RedisKeyValueStoreOpts {
+    fn build_store(&self, _config_opts: &RuntimeConfigOpts) -> Result<KeyValueStore> {
+        Ok(Arc::new(spin_key_value_redis::KeyValueRedis::new(
+            self.url.clone(),
+        )))
     }
 }
 
