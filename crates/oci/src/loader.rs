@@ -131,7 +131,7 @@ impl OciLoader {
     }
 }
 
-fn content_digest(content_ref: &ContentRef) -> Result<&str> {
+pub fn content_digest(content_ref: &ContentRef) -> Result<&str> {
     content_ref
         .digest
         .as_deref()

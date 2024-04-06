@@ -408,7 +408,7 @@ impl HttpTrigger {
     }
 }
 
-fn parse_listen_addr(addr: &str) -> anyhow::Result<SocketAddr> {
+pub fn parse_listen_addr(addr: &str) -> anyhow::Result<SocketAddr> {
     let addrs: Vec<SocketAddr> = addr.to_socket_addrs()?.collect();
     // Prefer 127.0.0.1 over e.g. [::1] because CHANGE IS HARD
     if let Some(addr) = addrs
