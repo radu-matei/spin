@@ -120,7 +120,7 @@ impl Default for Config {
                 // `StoreLimitsAsync` accounting method too.
                 .max_memory_size(4 * GB)
                 // These numbers are completely arbitrary at something above 0.
-                .linear_memory_keep_resident((2 * MB) as usize)
+                // .linear_memory_keep_resident((2 * MB) as usize)
                 .table_keep_resident((MB / 2) as usize);
             inner.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling_config));
         }
