@@ -1,0 +1,115 @@
+diff --git a/crates/factor-outbound-http/src/lib.rs b/crates/factor-outbound-http/src/lib.rs
+index ea270e5d..f566ea3b 100644
+--- a/crates/factor-outbound-http/src/lib.rs
++++ b/crates/factor-outbound-http/src/lib.rs
+@@ -73,7 +73,7 @@ impl Factor for OutboundHttpFactor {
+ 
+ pub struct InstanceState {
+     wasi_http_ctx: WasiHttpCtx,
+-    allowed_hosts: OutboundAllowedHosts,
++    pub allowed_hosts: OutboundAllowedHosts,
+     blocked_networks: BlockedNetworks,
+     component_tls_configs: ComponentTlsClientConfigs,
+     self_request_origin: Option<SelfRequestOrigin>,
+diff --git a/crates/trigger-http/src/outbound_http.rs b/crates/trigger-http/src/outbound_http.rs
+index 70c41da8..41fd6f3c 100644
+--- a/crates/trigger-http/src/outbound_http.rs
++++ b/crates/trigger-http/src/outbound_http.rs
+@@ -3,24 +3,30 @@ use std::{
+     sync::Arc,
+ };
+ 
+-use http::uri::Scheme;
++use http::{uri::Scheme, HeaderName, HeaderValue};
+ use spin_core::async_trait;
+ use spin_factor_outbound_http::intercept::{self, InterceptOutcome, InterceptRequest};
+-use spin_factor_outbound_networking::config::allowed_hosts::parse_service_chaining_target;
++use spin_factor_outbound_networking::config::allowed_hosts::{
++    parse_service_chaining_target, OutboundAllowedHosts,
++};
+ use spin_factors::RuntimeFactors;
+ use spin_http::routes::RouteMatch;
+-use wasmtime_wasi_http::{HttpError, HttpResult};
++use wasmtime_wasi_http::{bindings::http::outgoing_handler::ErrorCode, HttpError, HttpResult};
+ 
+ use crate::HttpServer;
+ 
+ /// An outbound HTTP interceptor that handles service chaining requests.
+ pub struct OutboundHttpInterceptor<F: RuntimeFactors> {
+     server: Arc<HttpServer<F>>,
++    allowed_hosts: OutboundAllowedHosts,
+ }
+ 
+ impl<F: RuntimeFactors> OutboundHttpInterceptor<F> {
+-    pub fn new(server: Arc<HttpServer<F>>) -> Self {
+-        Self { server }
++    pub fn new(server: Arc<HttpServer<F>>, allowed_hosts: OutboundAllowedHosts) -> Self {
++        Self {
++            server,
++            allowed_hosts,
++        }
+     }
+ }
+ 
+@@ -28,7 +34,7 @@ const CHAINED_CLIENT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new
+ 
+ #[async_trait]
+ impl<F: RuntimeFactors> intercept::OutboundHttpInterceptor for OutboundHttpInterceptor<F> {
+-    async fn intercept(&self, request: InterceptRequest) -> HttpResult<InterceptOutcome> {
++    async fn intercept(&self, mut request: InterceptRequest) -> HttpResult<InterceptOutcome> {
+         // Handle service chaining requests
+         if let Some(component_id) = parse_service_chaining_target(request.uri()) {
+             let req = request.into_hyper_request();
+@@ -41,7 +47,36 @@ impl<F: RuntimeFactors> intercept::OutboundHttpInterceptor for OutboundHttpInter
+                 .map_err(HttpError::trap)?;
+             Ok(InterceptOutcome::Complete(resp))
+         } else {
++            // For demo purposes we need a way to send a request to an IP that doesn't match
++            // its 'host' header. This allows the guest to set
++            // 'fermyon-override-host' which will override 'host' here after
++            // wasi-http is done forbidding that.
++            // The 'check_override_host' makes this not an allowed_outbound_hosts bypass.
++            const FERMYON_OVERRIDE_HOST: HeaderName =
++                HeaderName::from_static("fermyon-override-host");
++            if let Some(override_host) = request.headers_mut().remove(FERMYON_OVERRIDE_HOST) {
++                self.check_override_host(&override_host)
++                    .await
++                    .map_err(|err| ErrorCode::InternalError(Some(err.to_string())))?;
++                request
++                    .headers_mut()
++                    .insert(hyper::header::HOST, override_host);
++            }
+             Ok(InterceptOutcome::Continue(request))
+         }
+     }
+ }
++
++impl<F: RuntimeFactors> OutboundHttpInterceptor<F> {
++    /// Check fermyon-override-host
++    /// See https://github.com/fermyon/lhc/issues/741
++    async fn check_override_host(&self, host_value: &HeaderValue) -> anyhow::Result<()> {
++        let host_str = host_value.to_str()?;
++        let allowed = self
++            .allowed_hosts
++            .check_url(&format!("https://{host_str}"), "")
++            .await?;
++        anyhow::ensure!(allowed, "not allowed by allowed_outbound_hosts");
++        Ok(())
++    }
++}
+diff --git a/crates/trigger-http/src/server.rs b/crates/trigger-http/src/server.rs
+index 92cdd4e8..a2be9162 100644
+--- a/crates/trigger-http/src/server.rs
++++ b/crates/trigger-http/src/server.rs
+@@ -255,7 +255,10 @@ impl<F: RuntimeFactors> HttpServer<F> {
+         )?;
+         let origin = SelfRequestOrigin::create(server_scheme, &self.listen_addr.to_string())?;
+         outbound_http.set_self_request_origin(origin);
+-        outbound_http.set_request_interceptor(OutboundHttpInterceptor::new(self.clone()))?;
++        outbound_http.set_request_interceptor(OutboundHttpInterceptor::new(
++            self.clone(),
++            outbound_http.allowed_hosts.clone(),
++        ))?;
+ 
+         // Prepare HTTP executor
+         let trigger_config = self.component_trigger_configs.get(component_id).unwrap();

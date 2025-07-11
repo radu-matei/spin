@@ -73,7 +73,7 @@ impl Factor for OutboundHttpFactor {
 
 pub struct InstanceState {
     wasi_http_ctx: WasiHttpCtx,
-    allowed_hosts: OutboundAllowedHosts,
+    pub allowed_hosts: OutboundAllowedHosts,
     blocked_networks: BlockedNetworks,
     component_tls_configs: ComponentTlsClientConfigs,
     self_request_origin: Option<SelfRequestOrigin>,

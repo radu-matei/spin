@@ -255,7 +255,10 @@ impl<F: RuntimeFactors> HttpServer<F> {
         )?;
         let origin = SelfRequestOrigin::create(server_scheme, &self.listen_addr.to_string())?;
         outbound_http.set_self_request_origin(origin);
-        outbound_http.set_request_interceptor(OutboundHttpInterceptor::new(self.clone()))?;
+        outbound_http.set_request_interceptor(OutboundHttpInterceptor::new(
+            self.clone(),
+            outbound_http.allowed_hosts.clone(),
+        ))?;
 
         // Prepare HTTP executor
         let trigger_config = self.component_trigger_configs.get(component_id).unwrap();
