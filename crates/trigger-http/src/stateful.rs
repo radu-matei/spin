@@ -55,6 +55,40 @@ impl<F: RuntimeFactors> wasmtime::component::AccessorTask<StoreData<F>>
     }
 }
 
+/// Spawned task that receives new HTTP requests from the channel and
+/// spawns a `HandleRequestTask` for each one.  By living as a spawned
+/// task (rather than the main `run_concurrent` closure), its tokio
+/// channel waker integrates properly with the accessor's scheduler,
+/// so new requests are picked up even while other tasks are in-flight.
+struct ReceiverTask<F: RuntimeFactors> {
+    task_rx: mpsc::UnboundedReceiver<HttpTask>,
+    service: Arc<wasmtime_wasi_http::p3::bindings::Service>,
+    getter: fn(&mut StoreData<F>) -> WasiHttpCtxView<'_>,
+    shutdown: oneshot::Sender<()>,
+}
+
+impl<F: RuntimeFactors> wasmtime::component::AccessorTask<StoreData<F>>
+    for ReceiverTask<F>
+{
+    fn run(
+        self,
+        accessor: &Accessor<StoreData<F>>,
+    ) -> impl std::future::Future<Output = wasmtime::Result<()>> + Send {
+        async move {
+            let mut task_rx = self.task_rx;
+            while let Some(task) = task_rx.recv().await {
+                accessor.spawn(HandleRequestTask::<F> {
+                    service: Arc::clone(&self.service),
+                    getter: self.getter,
+                    task,
+                });
+            }
+            let _ = self.shutdown.send(());
+            Ok(())
+        }
+    }
+}
+
 /// Handle to a background worker managing a live stateful component instance.
 struct StatefulWorker {
     task_tx: mpsc::UnboundedSender<HttpTask>,
@@ -112,9 +146,20 @@ impl<F: RuntimeFactors> StatefulInstanceManager<F> {
         }
 
         let worker = self.spawn_worker(component_id, instance_id);
-        let result = Self::send_request(&worker, req).await;
+        let (response_tx, response_rx) = oneshot::channel();
+        worker
+            .task_tx
+            .send(HttpTask {
+                request: req,
+                response_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("stateful instance worker has exited"))?;
         write_guard.insert(key, worker);
-        result
+        drop(write_guard);
+
+        response_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("stateful instance worker dropped the request"))?
     }
 
     /// Send an HTTP request to a worker and await its response.
@@ -211,7 +256,7 @@ async fn run_stateful_worker<F: RuntimeFactors>(
     trigger_app: Arc<TriggerApp<F>>,
     component_id: &str,
     instance_id: &str,
-    mut task_rx: mpsc::UnboundedReceiver<HttpTask>,
+    task_rx: mpsc::UnboundedReceiver<HttpTask>,
 ) -> Result<()> {
     tracing::info!(component_id, instance_id, "Starting stateful component instance");
 
@@ -258,20 +303,32 @@ async fn run_stateful_worker<F: RuntimeFactors>(
     );
 
     // 6. Enter run_concurrent to handle HTTP requests concurrently.
-    //    Each incoming request is spawned as a separate task so that multiple
-    //    requests to the same instance can interleave at async yield points.
+    //
+    //    The channel receiver is wrapped in a spawned `ReceiverTask` rather
+    //    than polled directly in the main closure.  Inside run_concurrent the
+    //    accessor's scheduler does not re-poll the *main closure* when a tokio
+    //    waker fires while other spawned tasks are in-flight — but it does
+    //    properly schedule *spawned tasks* against each other.  By making the
+    //    receiver a spawned task, new channel messages are picked up promptly
+    //    even while HandleRequestTasks are awaiting WASI timers.
     let getter = (|data: &mut StoreData<F>| wasi_http::<F>(data).unwrap())
         as fn(&mut StoreData<F>) -> WasiHttpCtxView<'_>;
 
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+    let receiver = ReceiverTask::<F> {
+        task_rx,
+        service: Arc::clone(&service),
+        getter,
+        shutdown: shutdown_tx,
+    };
+
     let run_result = store
         .run_concurrent(async |accessor: &Accessor<StoreData<F>>| {
-            while let Some(task) = task_rx.recv().await {
-                accessor.spawn(HandleRequestTask::<F> {
-                    service: Arc::clone(&service),
-                    getter,
-                    task,
-                });
-            }
+            accessor.spawn(receiver);
+            // Keep the main closure alive until the ReceiverTask signals
+            // that the channel has closed (idle timeout).
+            let _ = shutdown_rx.await;
             anyhow::Ok(())
         })
         .await;
@@ -300,6 +357,7 @@ async fn handle_single_request<F: RuntimeFactors>(
     getter: fn(&mut StoreData<F>) -> WasiHttpCtxView<'_>,
     req: http::Request<Body>,
 ) -> Result<http::Response<Body>> {
+    let t0 = Instant::now();
     let (parts, body) = req.into_parts();
     let body = body.map_err(spin_factor_outbound_http::p2_to_p3_error_code);
     let request = http::Request::from_parts(parts, body);
@@ -309,12 +367,14 @@ async fn handle_single_request<F: RuntimeFactors>(
     let request_handle = accessor.with(|mut store| {
         anyhow::Ok(wasi_http::<F>(store.data_mut())?.table.push(request)?)
     })?;
+    tracing::info!("handle_single_request: push_request +{:.3}s", t0.elapsed().as_secs_f64());
 
     // Call the component's HTTP handler (async WIT export)
     let (response_result, task) = service
         .wasi_http_handler()
         .call_handle(accessor, request_handle)
         .await?;
+    tracing::info!("handle_single_request: call_handle done +{:.3}s", t0.elapsed().as_secs_f64());
 
     // Extract response from resource table
     let response = accessor.with(|mut store| {
@@ -325,9 +385,11 @@ async fn handle_single_request<F: RuntimeFactors>(
     let response = accessor.with(|mut store| {
         response.into_http_with_getter(&mut store, request_io_result, getter)
     })?;
+    tracing::info!("handle_single_request: response extracted +{:.3}s", t0.elapsed().as_secs_f64());
 
     // Wait for any async streaming work to complete
     task.block(accessor).await;
+    tracing::info!("handle_single_request: task.block done +{:.3}s", t0.elapsed().as_secs_f64());
 
     Ok(response.map(|body| {
         MutexBody::new(body.map_err(spin_factor_outbound_http::p3_to_p2_error_code))
