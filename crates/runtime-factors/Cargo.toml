@@ -20,6 +20,9 @@ spin-common = { path = "../common" }
 spin-factor-key-value = { path = "../factor-key-value" }
 spin-factor-llm = { path = "../factor-llm" }
 spin-factor-otel = { path = "../factor-otel" }
+# Out-of-tree factor: lives in the sibling spin-trigger-openmoq checkout.
+# For upstreaming, replace with a published crate or git dep.
+spin-factor-openmoq-outbound = { path = "../../../spin-trigger-openmoq/crates/factor" }
 spin-factor-outbound-http = { path = "../factor-outbound-http" }
 spin-factor-outbound-mqtt = { path = "../factor-outbound-mqtt" }
 spin-factor-outbound-mysql = { path = "../factor-outbound-mysql" }

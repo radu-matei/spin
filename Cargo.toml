@@ -210,6 +210,27 @@ spin-componentize = { path = "crates/componentize" }
 # TODO: Remove this once https://github.com/rust-lang/rust-clippy/issues/12281 is resolved
 blocks_in_conditions = "allow"
 
+# --- Dev-only patch for the out-of-tree spin-factor-openmoq-outbound
+#     path dep. That crate's manifest uses `workspace = true` to inherit
+#     `spin-factors`, `spin-factor-outbound-networking`, etc. from the
+#     spin-trigger-openmoq workspace, which sources them from git at
+#     rev a794d6e7. Without this patch, Cargo resolves those to separate
+#     crate instances from Spin's own local path deps, producing
+#     duplicate-crate trait errors. Repoint them back to our in-tree
+#     paths so there is one `spin-factors`, etc. in the dep graph.
+[patch."https://github.com/spinframework/spin"]
+spin-factors                     = { path = "crates/factors" }
+spin-factor-variables            = { path = "crates/factor-variables" }
+spin-factor-outbound-networking  = { path = "crates/factor-outbound-networking" }
+spin-factor-wasi                 = { path = "crates/factor-wasi" }
+spin-factors-test                = { path = "crates/factors-test" }
+spin-core                        = { path = "crates/core" }
+spin-app                         = { path = "crates/app" }
+spin-trigger                     = { path = "crates/trigger" }
+spin-telemetry                   = { path = "crates/telemetry" }
+spin-factors-executor            = { path = "crates/factors-executor" }
+spin-runtime-factors             = { path = "crates/runtime-factors" }
+
 [[bin]]
 name = "spin"
 path = "src/bin/spin.rs"

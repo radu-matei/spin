@@ -10,6 +10,7 @@ use anyhow::Context as _;
 use spin_common::arg_parser::parse_kv;
 use spin_factor_key_value::KeyValueFactor;
 use spin_factor_llm::LlmFactor;
+use spin_factor_openmoq_outbound::OpenMoqOutboundFactor;
 use spin_factor_otel::OtelFactor;
 use spin_factor_outbound_http::OutboundHttpFactor;
 use spin_factor_outbound_mqtt::{NetworkedMqttClient, OutboundMqttFactor};
@@ -37,6 +38,7 @@ pub struct TriggerFactors {
     pub mqtt: OutboundMqttFactor,
     pub pg: OutboundPgFactor,
     pub mysql: OutboundMysqlFactor,
+    pub openmoq_outbound: OpenMoqOutboundFactor,
     pub llm: LlmFactor,
 }
 
@@ -60,6 +62,7 @@ impl TriggerFactors {
             mqtt: OutboundMqttFactor::new(NetworkedMqttClient::creator()),
             pg: OutboundPgFactor::new(),
             mysql: OutboundMysqlFactor::new(),
+            openmoq_outbound: OpenMoqOutboundFactor::new(),
             llm: LlmFactor::new(
                 spin_factor_llm::spin::default_engine_creator(state_dir)
                     .context("failed to configure LLM factor")?,
