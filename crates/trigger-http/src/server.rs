@@ -3,7 +3,7 @@ use std::{
     future::Future,
     io::{ErrorKind, IsTerminal},
     net::SocketAddr,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, Weak},
     time::Duration,
 };
 
@@ -87,6 +87,12 @@ pub struct HttpServer<F: RuntimeFactors> {
     component_handler_types: HashMap<String, HandlerType<HttpHandlerState<F>>>,
     /// Manager for stateful component instances.
     stateful_manager: Arc<StatefulInstanceManager<F>>,
+    /// A weak self-reference, populated once the server is wrapped in an `Arc`.
+    ///
+    /// Used by the wasip3 [`HandlerState::new_store`] path to install the
+    /// outbound request interceptor and self-request origin on each instance,
+    /// matching what the p2 path does in [`Self::respond_wasm_component`].
+    pub(crate) self_weak: Arc<OnceLock<Weak<HttpServer<F>>>>,
 }
 
 impl<F: RuntimeFactors> HttpServer<F> {
@@ -144,6 +150,11 @@ impl<F: RuntimeFactors> HttpServer<F> {
 
         let trigger_app = Arc::new(trigger_app);
 
+        // Populated with a weak self-reference once the server is wrapped in an
+        // `Arc` (see `HttpTrigger::into_server`). Shared with each component's
+        // `HttpHandlerState` so the wasip3 path can install outbound interception.
+        let self_weak: Arc<OnceLock<Weak<HttpServer<F>>>> = Arc::new(OnceLock::new());
+
         let component_handler_types = component_trigger_configs
             .iter()
             .filter_map(|(key, trigger_config)| match key {
@@ -153,6 +164,7 @@ impl<F: RuntimeFactors> HttpServer<F> {
                         component,
                         &trigger_config.executor,
                         reuse_config,
+                        &self_weak,
                     )
                     .map(|ht| (component.clone(), ht)),
                 ),
@@ -178,6 +190,7 @@ impl<F: RuntimeFactors> HttpServer<F> {
             component_handler_types,
             output_format,
             stateful_manager,
+            self_weak,
         })
     }
 
@@ -186,6 +199,7 @@ impl<F: RuntimeFactors> HttpServer<F> {
         component_id: &str,
         executor: &Option<HttpExecutorType>,
         reuse_config: InstanceReuseConfig,
+        self_weak: &Arc<OnceLock<Weak<HttpServer<F>>>>,
     ) -> anyhow::Result<HandlerType<HttpHandlerState<F>>> {
         let pre = trigger_app.get_instance_pre(component_id)?;
         let handler_type = match executor {
@@ -195,6 +209,7 @@ impl<F: RuntimeFactors> HttpServer<F> {
                     trigger_app: trigger_app.clone(),
                     component_id: component_id.into(),
                     reuse_config,
+                    self_weak: self_weak.clone(),
                 },
             )?,
             Some(HttpExecutorType::Wagi(wagi_config)) => {
@@ -727,17 +742,43 @@ pub(crate) struct HttpHandlerState<F: RuntimeFactors> {
     trigger_app: Arc<TriggerApp<F>>,
     component_id: String,
     reuse_config: InstanceReuseConfig,
+    /// Weak reference to the owning server, used to install outbound request
+    /// interception on each instance (see [`HttpServer::self_weak`]).
+    self_weak: Arc<OnceLock<Weak<HttpServer<F>>>>,
 }
 
 impl<F: RuntimeFactors> HandlerState for HttpHandlerState<F> {
     type StoreData = InstanceState<F::InstanceState, ()>;
 
     fn new_store(&self, _req_id: Option<u64>) -> wasmtime::Result<StoreBundle<Self::StoreData>> {
+        let mut builder = self
+            .trigger_app
+            .prepare(&self.component_id)
+            .to_wasmtime_result()?;
+
+        // Install the outbound request interceptor and self-request origin for
+        // this wasip3 instance, mirroring `respond_wasm_component` (the p2 path).
+        // Without this, wasip3 components cannot use service chaining,
+        // self-requests, or stateful `spin.alt` addressing.
+        if let Some(server) = self.self_weak.get().and_then(Weak::upgrade) {
+            if let Some(outbound) = builder.factor_builder::<OutboundHttpFactor>() {
+                let scheme = if server.tls_config.is_some() {
+                    Scheme::HTTPS
+                } else {
+                    Scheme::HTTP
+                };
+                let self_addr = server.get_local_addr();
+                let origin = SelfRequestOrigin::create(scheme, &self_addr.to_string())
+                    .to_wasmtime_result()?;
+                outbound.set_self_request_origin(origin);
+                outbound
+                    .set_request_interceptor(OutboundHttpInterceptor::new(server.clone()))
+                    .to_wasmtime_result()?;
+            }
+        }
+
         Ok(StoreBundle {
-            store: self
-                .trigger_app
-                .prepare(&self.component_id)
-                .to_wasmtime_result()?
+            store: builder
                 .instantiate_store(())
                 .to_wasmtime_result()?
                 .into_inner(),

@@ -390,6 +390,9 @@ impl HttpTrigger {
             output_format,
             stateful_idle_timeout,
         )?);
+        // Populate the server's weak self-reference now that it lives in an
+        // `Arc`, so the wasip3 instance path can install outbound interception.
+        let _ = server.self_weak.set(Arc::downgrade(&server));
         Ok(server)
     }
 
