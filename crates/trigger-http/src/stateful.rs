@@ -1,6 +1,9 @@
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -22,11 +25,24 @@ use crate::TriggerApp;
 
 const LIFECYCLE_EXPORT: &str = "spin:stateful-component/lifecycle@0.1.0";
 
+/// Maximum number of live stateful instances kept in memory at once. When the
+/// cap is reached, the least-recently-used idle instance is suspended to make
+/// room, bounding memory against a flood of distinct instance IDs.
+const DEFAULT_MAX_INSTANCES: usize = 1024;
+
+/// Bounded capacity of each worker's request channel. Sending blocks — applying
+/// backpressure to the caller — when an instance falls this far behind.
+const WORKER_CHANNEL_CAPACITY: usize = 64;
+
 type StoreData<F> = InstanceState<<F as RuntimeFactors>::InstanceState, ()>;
 
 struct HttpTask {
     request: http::Request<Body>,
     response_tx: oneshot::Sender<Result<http::Response<Body>>>,
+    /// Keeps the request counted as in-flight from reservation (under the
+    /// workers lock) until the response body has finished streaming, so the
+    /// worker is never evicted out from under a still-streaming body.
+    in_flight: InFlightGuard,
 }
 
 /// Task for handling a single HTTP request, spawned concurrently within
@@ -45,16 +61,14 @@ impl<F: RuntimeFactors> wasmtime::component::AccessorTask<StoreData<F>>
         accessor: &Accessor<StoreData<F>>,
     ) -> impl std::future::Future<Output = wasmtime::Result<()>> + Send {
         async move {
-            match handle_single_request::<F>(
-                accessor,
-                &self.service,
-                self.getter,
-                self.task.request,
-            )
-            .await
-            {
+            let HttpTask {
+                request,
+                response_tx,
+                in_flight,
+            } = self.task;
+            match handle_single_request::<F>(accessor, &self.service, self.getter, request).await {
                 Ok((response, body_rx)) => {
-                    if self.task.response_tx.send(Ok(response)).is_ok() {
+                    if response_tx.send(Ok(response)).is_ok() {
                         // Keep this spawned task — and therefore the store's
                         // event loop — alive until Hyper has finished reading
                         // the response body; otherwise the guest would not get
@@ -63,9 +77,13 @@ impl<F: RuntimeFactors> wasmtime::component::AccessorTask<StoreData<F>>
                     }
                 }
                 Err(e) => {
-                    let _ = self.task.response_tx.send(Err(e));
+                    let _ = response_tx.send(Err(e));
                 }
             }
+            // Release the in-flight reservation only now that the body has been
+            // fully streamed, so eviction can't tear the instance down
+            // mid-stream and truncate the response body.
+            drop(in_flight);
             Ok(())
         }
     }
@@ -77,7 +95,7 @@ impl<F: RuntimeFactors> wasmtime::component::AccessorTask<StoreData<F>>
 /// channel waker integrates properly with the accessor's scheduler,
 /// so new requests are picked up even while other tasks are in-flight.
 struct ReceiverTask<F: RuntimeFactors> {
-    task_rx: mpsc::UnboundedReceiver<HttpTask>,
+    task_rx: mpsc::Receiver<HttpTask>,
     service: Arc<wasmtime_wasi_http::p3::bindings::Service>,
     getter: fn(&mut StoreData<F>) -> WasiHttpCtxView<'_>,
     shutdown: oneshot::Sender<()>,
@@ -107,8 +125,60 @@ impl<F: RuntimeFactors> wasmtime::component::AccessorTask<StoreData<F>>
 
 /// Handle to a background worker managing a live stateful component instance.
 struct StatefulWorker {
-    task_tx: mpsc::UnboundedSender<HttpTask>,
+    /// Generation id, used to guard self-eviction against a newer worker having
+    /// already replaced this one under the same key.
+    id: u64,
+    task_tx: mpsc::Sender<HttpTask>,
     last_activity: Arc<std::sync::Mutex<Instant>>,
+    /// Number of requests currently outstanding (queued or in-flight). A worker
+    /// is only evicted while this is zero, so eviction never drops live work.
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl StatefulWorker {
+    /// The bits needed to dispatch a request after the workers map lock has
+    /// been released.
+    fn handle(&self) -> WorkerHandle {
+        WorkerHandle {
+            task_tx: self.task_tx.clone(),
+            last_activity: Arc::clone(&self.last_activity),
+        }
+    }
+}
+
+/// Cloned worker bits used to dispatch a request without holding the workers
+/// map lock across the (possibly blocking) send + response await.
+#[derive(Clone)]
+struct WorkerHandle {
+    task_tx: mpsc::Sender<HttpTask>,
+    last_activity: Arc<std::sync::Mutex<Instant>>,
+}
+
+/// Increments a worker's in-flight count on creation and decrements on drop,
+/// so a request is counted as outstanding for its whole lifetime (queued and
+/// processing). Eviction is gated on the count being zero.
+struct InFlightGuard(Arc<AtomicUsize>);
+
+impl InFlightGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The outcome of trying to dispatch a request to a worker.
+enum DispatchOutcome {
+    /// The worker accepted the request; carries its (possibly error) response.
+    Handled(Result<http::Response<Body>>),
+    /// The worker's channel was closed (it has exited); the request is returned
+    /// so the caller can recreate the instance and retry.
+    WorkerGone(http::Request<Body>),
 }
 
 /// Manages long-lived stateful component instances keyed by (component_id, instance_id).
@@ -124,6 +194,10 @@ pub struct StatefulInstanceManager<F: RuntimeFactors> {
     workers: RwLock<HashMap<(String, String), StatefulWorker>>,
     trigger_app: Arc<TriggerApp<F>>,
     idle_timeout: Duration,
+    /// Maximum number of live instances before LRU eviction kicks in.
+    max_instances: usize,
+    /// Monotonic source of worker generation ids.
+    next_worker_id: AtomicU64,
 }
 
 impl<F: RuntimeFactors> StatefulInstanceManager<F> {
@@ -132,54 +206,81 @@ impl<F: RuntimeFactors> StatefulInstanceManager<F> {
             workers: RwLock::new(HashMap::new()),
             trigger_app,
             idle_timeout,
+            max_instances: DEFAULT_MAX_INSTANCES,
+            next_worker_id: AtomicU64::new(0),
         }
     }
 
     /// Handle an HTTP request to a stateful component instance.
     pub async fn handle_request(
-        &self,
+        self: &Arc<Self>,
         req: http::Request<Body>,
         component_id: &str,
         instance_id: &str,
     ) -> Result<http::Response<Body>> {
         let key = (component_id.to_string(), instance_id.to_string());
 
-        // Fast path: worker already exists
-        {
+        // Fast path: dispatch to an existing worker. We reserve the in-flight
+        // slot and clone the handle while holding the read lock, then release
+        // the lock before sending — so we never hold the lock across an await,
+        // and the idle checker can't evict a worker we're about to use.
+        let existing = {
             let guard = self.workers.read().await;
-            if let Some(worker) = guard.get(&key) {
-                *worker.last_activity.lock().unwrap() = Instant::now();
-                return Self::send_request(worker, req).await;
+            guard
+                .get(&key)
+                .map(|w| (w.handle(), InFlightGuard::new(Arc::clone(&w.in_flight))))
+        };
+        let req = if let Some((handle, in_flight)) = existing {
+            match Self::dispatch(handle, in_flight, req).await {
+                DispatchOutcome::Handled(resp) => return resp,
+                // Worker has exited; fall through to recreate the instance.
+                DispatchOutcome::WorkerGone(req) => req,
+            }
+        } else {
+            req
+        };
+
+        // Slow path: only `stateful = true` components may be addressed here.
+        self.ensure_stateful(component_id)?;
+
+        // Slow path: (re)create the worker under the write lock — reusing a
+        // live one if a concurrent request already created it — and dispatch.
+        // Retry once if the chosen worker exits between the liveness check and
+        // the send (self-eviction or a trap racing the check); bounded so it
+        // can never loop.
+        let mut req = req;
+        for _ in 0..2 {
+            let (handle, in_flight) = {
+                let mut guard = self.workers.write().await;
+                let live = guard
+                    .get(&key)
+                    .filter(|w| !w.task_tx.is_closed())
+                    .map(|w| (w.handle(), Arc::clone(&w.in_flight)));
+                let (handle, counter) = match live {
+                    Some(hc) => hc,
+                    None => {
+                        if !guard.contains_key(&key) && guard.len() >= self.max_instances {
+                            self.evict_lru_idle(&mut guard);
+                        }
+                        let worker = self.spawn_worker(&key);
+                        let hc = (worker.handle(), Arc::clone(&worker.in_flight));
+                        guard.insert(key.clone(), worker);
+                        hc
+                    }
+                };
+                // Reserve the in-flight slot under the lock, before dispatching.
+                (handle, InFlightGuard::new(counter))
+            };
+
+            match Self::dispatch(handle, in_flight, req).await {
+                DispatchOutcome::Handled(resp) => return resp,
+                DispatchOutcome::WorkerGone(returned) => req = returned,
             }
         }
 
-        // Slow path: create worker
-        let mut write_guard = self.workers.write().await;
-        // Double-check after acquiring write lock
-        if let Some(worker) = write_guard.get(&key) {
-            *worker.last_activity.lock().unwrap() = Instant::now();
-            return Self::send_request(worker, req).await;
-        }
-
-        // Only components explicitly marked `stateful = true` may be addressed
-        // via `spin.alt`; others don't export the lifecycle interface.
-        self.ensure_stateful(component_id)?;
-
-        let worker = self.spawn_worker(component_id, instance_id);
-        let (response_tx, response_rx) = oneshot::channel();
-        worker
-            .task_tx
-            .send(HttpTask {
-                request: req,
-                response_tx,
-            })
-            .map_err(|_| anyhow::anyhow!("stateful instance worker has exited"))?;
-        write_guard.insert(key, worker);
-        drop(write_guard);
-
-        response_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("stateful instance worker dropped the request"))?
+        Err(anyhow::anyhow!(
+            "stateful instance worker exited before handling the request"
+        ))
     }
 
     /// Verify the target component is declared `stateful = true`.
@@ -199,46 +300,100 @@ impl<F: RuntimeFactors> StatefulInstanceManager<F> {
         Ok(())
     }
 
-    /// Send an HTTP request to a worker and await its response.
-    async fn send_request(
-        worker: &StatefulWorker,
+    /// Dispatch a request to a worker via its handle, holding the in-flight
+    /// reservation for the whole call. Returns [`DispatchOutcome::WorkerGone`]
+    /// (with the request) if the worker's channel has closed.
+    async fn dispatch(
+        handle: WorkerHandle,
+        in_flight: InFlightGuard,
         req: http::Request<Body>,
-    ) -> Result<http::Response<Body>> {
+    ) -> DispatchOutcome {
         let (response_tx, response_rx) = oneshot::channel();
-        worker
-            .task_tx
-            .send(HttpTask {
-                request: req,
-                response_tx,
-            })
-            .map_err(|_| anyhow::anyhow!("stateful instance worker has exited"))?;
-        response_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("stateful instance worker dropped the request"))?
+        // The in-flight guard travels with the task so the worker holds the
+        // reservation until the response body has finished streaming (not just
+        // until the response head is delivered here).
+        let task = HttpTask {
+            request: req,
+            response_tx,
+            in_flight,
+        };
+        // Bounded send: blocks (backpressure) while the instance is behind, and
+        // errors — returning the task — only once the worker has exited.
+        match handle.task_tx.send(task).await {
+            Ok(()) => {
+                *handle.last_activity.lock().unwrap() = Instant::now();
+                DispatchOutcome::Handled(response_rx.await.unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!("stateful instance worker dropped the request"))
+                }))
+            }
+            Err(mpsc::error::SendError(task)) => DispatchOutcome::WorkerGone(task.request),
+        }
+    }
+
+    /// Evict the least-recently-used idle worker to stay within the instance
+    /// cap. Only idle workers (no outstanding requests) are eligible, so live
+    /// work is never dropped.
+    fn evict_lru_idle(&self, workers: &mut HashMap<(String, String), StatefulWorker>) {
+        let victim = workers
+            .iter()
+            .filter(|(_, w)| w.in_flight.load(Ordering::SeqCst) == 0)
+            .min_by_key(|(_, w)| *w.last_activity.lock().unwrap())
+            .map(|(key, _)| key.clone());
+        match victim {
+            Some(key) => {
+                tracing::info!(
+                    component_id = key.0,
+                    instance_id = key.1,
+                    "Evicting LRU stateful instance to stay within the instance cap"
+                );
+                // Dropping the worker closes its channel, which makes the
+                // background worker exit run_concurrent and call suspend.
+                workers.remove(&key);
+            }
+            None => tracing::warn!(
+                "stateful instance cap reached but all instances are busy; \
+                 temporarily exceeding the cap"
+            ),
+        }
     }
 
     /// Spawn a background worker for a new stateful component instance.
-    fn spawn_worker(&self, component_id: &str, instance_id: &str) -> StatefulWorker {
-        let (task_tx, task_rx) = mpsc::unbounded_channel();
+    ///
+    /// When the worker task exits — from idle suspension, eviction, or a
+    /// failure/trap during instantiation or handling — it removes its own entry
+    /// from the map (unless a newer worker has already taken its place), so a
+    /// subsequent request creates a fresh instance instead of wedging on a dead
+    /// one.
+    fn spawn_worker(self: &Arc<Self>, key: &(String, String)) -> StatefulWorker {
+        let id = self.next_worker_id.fetch_add(1, Ordering::Relaxed);
+        let (task_tx, task_rx) = mpsc::channel(WORKER_CHANNEL_CAPACITY);
         let last_activity = Arc::new(std::sync::Mutex::new(Instant::now()));
+        let in_flight = Arc::new(AtomicUsize::new(0));
 
-        let trigger_app = Arc::clone(&self.trigger_app);
-        let cid = component_id.to_string();
-        let iid = instance_id.to_string();
-
+        let manager = Arc::clone(self);
+        let key = key.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_stateful_worker::<F>(trigger_app, &cid, &iid, task_rx).await {
+            if let Err(e) =
+                run_stateful_worker::<F>(manager.trigger_app.clone(), &key.0, &key.1, task_rx).await
+            {
                 tracing::error!(
-                    component_id = cid,
-                    instance_id = iid,
+                    component_id = key.0,
+                    instance_id = key.1,
                     "stateful instance worker failed: {e:?}"
                 );
+            }
+            // Self-evict, unless a newer worker has already replaced us.
+            let mut workers = manager.workers.write().await;
+            if workers.get(&key).map(|w| w.id) == Some(id) {
+                workers.remove(&key);
             }
         });
 
         StatefulWorker {
+            id,
             task_tx,
             last_activity,
+            in_flight,
         }
     }
 
@@ -250,13 +405,19 @@ impl<F: RuntimeFactors> StatefulInstanceManager<F> {
             loop {
                 interval.tick().await;
 
+                // A worker is idle only when it has no outstanding requests and
+                // hasn't been used within the timeout — so long-running requests
+                // are never evicted mid-flight.
+                let idle = |w: &StatefulWorker| {
+                    w.in_flight.load(Ordering::SeqCst) == 0
+                        && w.last_activity.lock().unwrap().elapsed() > manager.idle_timeout
+                };
+
                 let expired: Vec<(String, String)> = {
                     let guard = manager.workers.read().await;
                     guard
                         .iter()
-                        .filter(|(_, w)| {
-                            w.last_activity.lock().unwrap().elapsed() > manager.idle_timeout
-                        })
+                        .filter(|(_, w)| idle(w))
                         .map(|(key, _)| key.clone())
                         .collect()
                 };
@@ -267,15 +428,19 @@ impl<F: RuntimeFactors> StatefulInstanceManager<F> {
 
                 let mut write_guard = manager.workers.write().await;
                 for key in expired {
-                    tracing::info!(
-                        component_id = key.0,
-                        instance_id = key.1,
-                        "Suspending idle stateful component instance"
-                    );
-                    // Dropping the worker closes the task channel, which causes
-                    // the background worker to exit run_concurrent and call
-                    // lifecycle::suspend before cleaning up.
-                    write_guard.remove(&key);
+                    // Re-check under the write lock: a request may have arrived
+                    // (bumping activity / in-flight) since the read scan.
+                    if write_guard.get(&key).map(|w| idle(w)).unwrap_or(false) {
+                        tracing::info!(
+                            component_id = key.0,
+                            instance_id = key.1,
+                            "Suspending idle stateful component instance"
+                        );
+                        // Dropping the worker closes the task channel, which
+                        // causes the background worker to exit run_concurrent
+                        // and call lifecycle::suspend before cleaning up.
+                        write_guard.remove(&key);
+                    }
                 }
             }
         });
@@ -293,7 +458,7 @@ async fn run_stateful_worker<F: RuntimeFactors>(
     trigger_app: Arc<TriggerApp<F>>,
     component_id: &str,
     instance_id: &str,
-    task_rx: mpsc::UnboundedReceiver<HttpTask>,
+    task_rx: mpsc::Receiver<HttpTask>,
 ) -> Result<()> {
     tracing::info!(component_id, instance_id, "Starting stateful component instance");
 
