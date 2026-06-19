@@ -11,6 +11,9 @@ pub const SERVICE_CHAINING_DOMAIN: &str = "spin.internal";
 /// The domain suffix used for service chaining.
 pub const SERVICE_CHAINING_DOMAIN_SUFFIX: &str = ".spin.internal";
 
+/// The domain used for stateful component addressing.
+pub const STATEFUL_DOMAIN: &str = "spin.alt";
+
 /// An easily cloneable, shared, boxed future of result
 pub type SharedFutureResult<T> = Shared<BoxFuture<'static, Result<Arc<T>, Arc<anyhow::Error>>>>;
 
@@ -682,6 +685,38 @@ fn parse_service_chaining_host(host: &str) -> Option<String> {
     }
 }
 
+/// Checks if the host is the stateful component addressing domain.
+pub fn is_stateful_host(host: &str) -> bool {
+    let (host, _) = host.rsplit_once(':').unwrap_or((host, ""));
+    host == STATEFUL_DOMAIN
+}
+
+/// Parses a stateful component target from a URL.
+///
+/// URLs have the form: `https://spin.alt/component/<component-id>/<instance-id>/<path>`
+///
+/// Returns `(component_id, instance_id, remaining_path)` if the URL matches.
+pub fn parse_stateful_target(url: &http::Uri) -> Option<(String, String, String)> {
+    let host = url.authority().map(|a| a.host().trim())?;
+    let (host, _) = host.rsplit_once(':').unwrap_or((host, ""));
+
+    if host != STATEFUL_DOMAIN {
+        return None;
+    }
+
+    let path = url.path().trim_start_matches('/');
+    let path = path.strip_prefix("component/")?;
+
+    let (component_id, rest) = path.split_once('/')?;
+    let (instance_id, remaining) = rest.split_once('/').unwrap_or((rest, ""));
+
+    Some((
+        component_id.to_string(),
+        instance_id.to_string(),
+        format!("/{remaining}"),
+    ))
+}
+
 #[cfg(test)]
 mod test {
     impl AllowedHostConfig {
@@ -1209,5 +1244,43 @@ mod test {
         let hosts = &["https://{{ one }}", "{{ two }}", "https://three"];
         AllowedHostsConfig::validate(hosts, &resolver)
             .expect("empty resolutions should ignored as valid");
+    }
+
+    #[test]
+    fn is_stateful_host_matches_spin_alt() {
+        assert!(is_stateful_host("spin.alt"));
+        assert!(is_stateful_host("spin.alt:443"));
+        assert!(!is_stateful_host("spin.internal"));
+        assert!(!is_stateful_host("example.com"));
+    }
+
+    #[test]
+    fn parse_stateful_target_extracts_parts() {
+        let uri: http::Uri = "https://spin.alt/component/my-comp/inst-1/foo/bar"
+            .parse()
+            .unwrap();
+        let (component_id, instance_id, path) =
+            parse_stateful_target(&uri).expect("should parse stateful target");
+        assert_eq!(component_id, "my-comp");
+        assert_eq!(instance_id, "inst-1");
+        assert_eq!(path, "/foo/bar");
+    }
+
+    #[test]
+    fn parse_stateful_target_handles_empty_path() {
+        let uri: http::Uri = "https://spin.alt/component/my-comp/inst-1".parse().unwrap();
+        let (component_id, instance_id, path) =
+            parse_stateful_target(&uri).expect("should parse stateful target");
+        assert_eq!(component_id, "my-comp");
+        assert_eq!(instance_id, "inst-1");
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn parse_stateful_target_rejects_non_stateful_hosts() {
+        let uri: http::Uri = "https://example.com/component/c/i/p".parse().unwrap();
+        assert!(parse_stateful_target(&uri).is_none());
+        let chained: http::Uri = "https://foo.spin.internal/x".parse().unwrap();
+        assert!(parse_stateful_target(&chained).is_none());
     }
 }

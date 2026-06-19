@@ -24,7 +24,7 @@ pub use host::{
 pub use runtime_config::RuntimeConfig;
 use spin_core::async_trait;
 pub use spin_world::spin::key_value::key_value as v3;
-pub use util::DelegatingStoreManager;
+pub use util::{DelegatingStoreManager, INSTANCE_STORE_LABEL, InstanceScopedStoreManager};
 
 /// A factor that provides key-value storage.
 #[derive(Default)]
@@ -108,6 +108,7 @@ impl Factor for KeyValueFactor {
             store_manager: app_state.store_manager.clone(),
             allowed_stores,
             otel,
+            instance_id: None,
         })
     }
 }
@@ -188,6 +189,19 @@ pub struct InstanceBuilder {
     /// The allowed stores for this component instance.
     allowed_stores: HashSet<String>,
     otel: OtelFactorState,
+    /// If set, the [`INSTANCE_STORE_LABEL`] store is scoped to this instance
+    /// ID so each stateful component instance sees isolated data.
+    instance_id: Option<String>,
+}
+
+impl InstanceBuilder {
+    /// Scope the [`INSTANCE_STORE_LABEL`] store to the given instance ID.
+    ///
+    /// Used by stateful components so each long-lived instance gets its own
+    /// isolated key namespace within the shared underlying store.
+    pub fn set_instance_id(&mut self, instance_id: String) {
+        self.instance_id = Some(instance_id);
+    }
 }
 
 impl FactorInstanceBuilder for InstanceBuilder {
@@ -198,7 +212,14 @@ impl FactorInstanceBuilder for InstanceBuilder {
             store_manager,
             allowed_stores,
             otel,
+            instance_id,
         } = self;
+        let store_manager: Arc<dyn StoreManager> = match instance_id {
+            Some(instance_id) => {
+                Arc::new(InstanceScopedStoreManager::new(store_manager, instance_id))
+            }
+            None => store_manager,
+        };
         Ok(KeyValueDispatch::new_with_capacity(
             allowed_stores,
             store_manager,

@@ -51,6 +51,7 @@ use crate::{
     instrument::{MatchedRoute, finalize_http_span, http_span, instrument_error},
     outbound_http::OutboundHttpInterceptor,
     spin::SpinHttpExecutor,
+    stateful::StatefulInstanceManager,
     wagi::WagiHttpExecutor,
     wasi::WasiHttpExecutor,
     wasip3::Wasip3HttpExecutor,
@@ -84,6 +85,8 @@ pub struct HttpServer<F: RuntimeFactors> {
     component_trigger_configs: HashMap<spin_http::routes::TriggerLookupKey, HttpTriggerConfig>,
     // Component ID -> handler type
     component_handler_types: HashMap<String, HandlerType<HttpHandlerState<F>>>,
+    /// Manager for stateful component instances.
+    stateful_manager: Arc<StatefulInstanceManager<F>>,
 }
 
 impl<F: RuntimeFactors> HttpServer<F> {
@@ -96,6 +99,7 @@ impl<F: RuntimeFactors> HttpServer<F> {
         http1_max_buf_size: Option<usize>,
         reuse_config: InstanceReuseConfig,
         output_format: OutputFormat,
+        stateful_idle_timeout: Duration,
     ) -> anyhow::Result<Self> {
         // This needs to be a vec before building the router to handle duplicate routes
         let component_trigger_configs = trigger_app
@@ -155,6 +159,13 @@ impl<F: RuntimeFactors> HttpServer<F> {
                 spin_http::routes::TriggerLookupKey::Trigger(_) => None,
             })
             .collect::<anyhow::Result<_>>()?;
+
+        let stateful_manager = Arc::new(StatefulInstanceManager::new(
+            trigger_app.clone(),
+            stateful_idle_timeout,
+        ));
+        stateful_manager.start_idle_checker();
+
         Ok(Self {
             listen_addr,
             local_addr: OnceLock::new(),
@@ -166,6 +177,7 @@ impl<F: RuntimeFactors> HttpServer<F> {
             component_trigger_configs,
             component_handler_types,
             output_format,
+            stateful_manager,
         })
     }
 
@@ -458,6 +470,18 @@ impl<F: RuntimeFactors> HttpServer<F> {
                 Self::internal_error(None, route_match.raw_route())
             }
         }
+    }
+
+    /// Handle a request to a stateful component instance via `spin.alt`.
+    pub async fn handle_stateful_request(
+        self: &Arc<Self>,
+        req: Request<Body>,
+        component_id: &str,
+        instance_id: &str,
+    ) -> anyhow::Result<Response<Body>> {
+        self.stateful_manager
+            .handle_request(req, component_id, instance_id)
+            .await
     }
 
     fn respond_static_response(
