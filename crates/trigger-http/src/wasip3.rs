@@ -2,8 +2,9 @@ use crate::server::HttpHandlerState;
 use anyhow::{Context as _, Result};
 use futures::{FutureExt, channel::oneshot};
 use http_body_util::BodyExt;
+use spin_factor_otel::OtelFactor;
 use spin_factor_outbound_http::{NotifyOnDropBody, p3_to_p2_error_code};
-use spin_factors::RuntimeFactors;
+use spin_factors::{RuntimeFactors, RuntimeFactorsInstanceState};
 use spin_factors_executor::InstanceState;
 use spin_http::routes::RouteMatch;
 use std::net::SocketAddr;
@@ -38,6 +39,12 @@ impl<F: RuntimeFactors> Wasip3HttpExecutor<'_, F> {
         let request = http::Request::from_parts(request, body);
         let (request, request_io_result) = types::Request::from_http(request);
 
+        // Capture the `execute_wasm` span (current here, established by `#[instrument]`) so the
+        // guest's host calls — which run on the store's event loop, detached from this tracing
+        // scope under component-model-async — can reparent their spans under it instead of
+        // floating as separate trace roots.
+        let execute_wasm_span = tracing::Span::current();
+
         let (tx, rx) = oneshot::channel();
         self.0.spawn(
             None,
@@ -47,6 +54,16 @@ impl<F: RuntimeFactors> Wasip3HttpExecutor<'_, F> {
                         let Proxy::P3(guest) = guest else {
                             unreachable!();
                         };
+
+                        store.with(|mut store| {
+                            if let Some(otel) = store
+                                .data_mut()
+                                .factors_instance_state_mut()
+                                .get::<OtelFactor>()
+                            {
+                                otel.set_host_parent_context_from_span(&execute_wasm_span);
+                            }
+                        });
 
                         let request = store.with(|mut store| {
                             anyhow::Ok(wasi_http::<F>(store.data_mut())?.table.push(request)?)

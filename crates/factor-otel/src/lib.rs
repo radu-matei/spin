@@ -62,12 +62,9 @@ impl Factor for OtelFactor {
         &self,
         _: spin_factors::PrepareContext<T, Self>,
     ) -> anyhow::Result<Self::InstanceBuilder> {
-        if !self.enable_interface {
-            return Ok(InstanceState::default());
-        }
-
-        // Warn the user if they enabled experimental support but didn't supply any environment variables
-        if self.span_processor.is_none()
+        // Warn the user if they enabled the experimental guest interface but supplied no exporter.
+        if self.enable_interface
+            && self.span_processor.is_none()
             && self.metric_exporter.is_none()
             && self.log_processor.is_none()
         {
@@ -76,11 +73,16 @@ impl Factor for OtelFactor {
             );
         }
 
+        // Tracing state exists whenever OTel tracing is enabled (i.e. a span processor was built),
+        // independent of the experimental guest interface: host-factor span reparenting is host-side
+        // and useful for every component. The `enable_interface` flag only gates exposing the
+        // wasi:otel imports to guests (see `init`).
         Ok(InstanceState {
             tracing_state: self.span_processor.as_ref().map(|span_processor| {
                 Arc::new(RwLock::new(TracingState {
                     guest_span_contexts: Default::default(),
                     original_host_span_id: None,
+                    host_parent_context: None,
                     span_processor: span_processor.clone(),
                 }))
             }),
@@ -92,15 +94,6 @@ impl Factor for OtelFactor {
 
 impl OtelFactor {
     pub fn new(spin_version: &str, enable_interface: bool) -> anyhow::Result<Self> {
-        if !enable_interface {
-            return Ok(Self {
-                span_processor: None,
-                metric_exporter: None,
-                log_processor: None,
-                enable_interface,
-            });
-        }
-
         let resource = Resource::builder()
             .with_detectors(&[
                 // Set service.name from env OTEL_SERVICE_NAME > env OTEL_RESOURCE_ATTRIBUTES > spin
@@ -133,7 +126,7 @@ impl OtelFactor {
             None
         };
 
-        let metric_exporter = if otel_metrics_enabled() {
+        let metric_exporter = if enable_interface && otel_metrics_enabled() {
             let metric_exporter = match OtlpProtocol::metrics_protocol_from_env() {
                 OtlpProtocol::Grpc => opentelemetry_otlp::MetricExporter::builder()
                     .with_tonic()
@@ -148,7 +141,7 @@ impl OtelFactor {
             None
         };
 
-        let log_processor = if otel_logs_enabled() {
+        let log_processor = if enable_interface && otel_logs_enabled() {
             let log_exporter = match OtlpProtocol::logs_protocol_from_env() {
                 OtlpProtocol::Grpc => opentelemetry_otlp::LogExporter::builder()
                     .with_tonic()
@@ -184,6 +177,23 @@ pub struct InstanceState {
 
 impl SelfInstanceBuilder for InstanceState {}
 
+impl InstanceState {
+    /// Records the component's `execute_wasm` span as the fallback parent for host-factor spans.
+    ///
+    /// wasip2 guests call host functions synchronously within the `execute_wasm` span, so those
+    /// spans nest correctly on their own. wasip3/component-model-async guests instead have their
+    /// host calls driven by the store's event loop, detached from that scope — so without help the
+    /// host-factor spans (outbound HTTP, key-value, ...) get no parent and surface as separate
+    /// trace roots. Executors call this at guest entry, where `Span::current()` is still the
+    /// `execute_wasm` span; [`OtelFactorState::reparent_tracing_span`] then falls back to it when
+    /// there is no active guest span. A no-op when OTel tracing is disabled.
+    pub fn set_host_parent_context_from_span(&self, span: &tracing::Span) {
+        if let Some(tracing_state) = self.tracing_state.as_ref() {
+            tracing_state.write().unwrap().host_parent_context = Some(span.context());
+        }
+    }
+}
+
 /// Internal tracing state of the OtelFactor InstanceState.
 ///
 /// This data lives here rather than directly on InstanceState so that we can have multiple things
@@ -203,6 +213,15 @@ pub(crate) struct TracingState {
     /// We use this to avoid accidentally reparenting the original host span as a child of a guest
     /// span.
     pub(crate) original_host_span_id: Option<SpanId>,
+
+    /// The context of the component's `execute_wasm` span, captured at guest entry.
+    ///
+    /// Host-factor spans (outbound HTTP, key-value, ...) fall back to this as their parent when
+    /// there is no active guest span. It is what keeps those spans from floating as separate trace
+    /// roots for wasip3/component-model-async guests, whose host calls run on the store's event
+    /// loop detached from the host tracing scope (so `Span::current()` is no longer the
+    /// `execute_wasm` span when the host call runs). See [`InstanceState::set_host_parent_context_from_span`].
+    pub(crate) host_parent_context: Option<Context>,
 
     /// The span processor used to export spans.
     span_processor: Arc<BatchSpanProcessor<Tokio>>,
@@ -263,26 +282,33 @@ impl OtelFactorState {
             return;
         };
 
-        // If there are no active guest spans then there is nothing to do
-        let Some((_, active_span_context)) = tracing_state.guest_span_contexts.last() else {
+        let parent_context = if let Some((_, active_span_context)) =
+            tracing_state.guest_span_contexts.last()
+        {
+            // Prefer the last active guest span (when the guest uses the wasi:otel interface).
+            // Ensure that we are not reparenting the original host span.
+            if let Some(original_host_span_id) = tracing_state.original_host_span_id {
+                debug_assert_ne!(
+                    &original_host_span_id,
+                    &tracing::Span::current()
+                        .context()
+                        .span()
+                        .span_context()
+                        .span_id(),
+                    "Incorrectly attempting to reparent the original host span. Likely `reparent_tracing_span` was called in an incorrect location."
+                );
+            }
+            Context::new().with_remote_span_context(active_span_context.clone())
+        } else if let Some(host_parent_context) = tracing_state.host_parent_context.as_ref() {
+            // No guest span: fall back to the component's `execute_wasm` span captured at guest
+            // entry. This keeps host-factor spans nested in the trace for wasip3 guests, whose host
+            // calls run detached from the host tracing scope.
+            host_parent_context.clone()
+        } else {
+            // Nothing to reparent under.
             return;
         };
 
-        // Ensure that we are not reparenting the original host span
-        if let Some(original_host_span_id) = tracing_state.original_host_span_id {
-            debug_assert_ne!(
-                &original_host_span_id,
-                &tracing::Span::current()
-                    .context()
-                    .span()
-                    .span_context()
-                    .span_id(),
-                "Incorrectly attempting to reparent the original host span. Likely `reparent_tracing_span` was called in an incorrect location."
-            );
-        }
-
-        // Now reparent the current span to the last active guest span
-        let parent_context = Context::new().with_remote_span_context(active_span_context.clone());
         tracing::Span::current().set_parent(parent_context);
     }
 }
