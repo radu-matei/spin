@@ -12,6 +12,7 @@ use http_body_util::BodyExt;
 use spin_factors::RuntimeFactors;
 use spin_factors_executor::InstanceState;
 use tokio::sync::{mpsc, oneshot, RwLock};
+use tracing::Instrument as _;
 use wasmtime::component::Accessor;
 use wasmtime_wasi_http::{
     p2::body::HyperIncomingBody as Body,
@@ -43,6 +44,12 @@ struct HttpTask {
     /// workers lock) until the response body has finished streaming, so the
     /// worker is never evicted out from under a still-streaming body.
     in_flight: InFlightGuard,
+    /// The caller's tracing span (captured at dispatch, on the caller's task —
+    /// typically the outbound `spin_outbound_http.send_request` span). The
+    /// worker runs the guest on a different task, so the span is carried across
+    /// the channel and used as the parent of the per-request `execute_wasm`
+    /// span, keeping the stateful component's work in the caller's trace.
+    parent_span: tracing::Span,
 }
 
 /// Task for handling a single HTTP request, spawned concurrently within
@@ -51,6 +58,12 @@ struct HandleRequestTask<F: RuntimeFactors> {
     service: Arc<wasmtime_wasi_http::p3::bindings::Service>,
     getter: fn(&mut StoreData<F>) -> WasiHttpCtxView<'_>,
     task: HttpTask,
+    /// Component id, used to label the `execute_wasm` span so the stateful
+    /// component (not the `spin` host) is attributed in traces.
+    component_id: Arc<str>,
+    /// Instance id, recorded on the span so traces show which live instance
+    /// served the request.
+    instance_id: Arc<str>,
 }
 
 impl<F: RuntimeFactors> wasmtime::component::AccessorTask<StoreData<F>>
@@ -60,13 +73,41 @@ impl<F: RuntimeFactors> wasmtime::component::AccessorTask<StoreData<F>>
         self,
         accessor: &Accessor<StoreData<F>>,
     ) -> impl std::future::Future<Output = wasmtime::Result<()>> + Send {
+        let HandleRequestTask {
+            service,
+            getter,
+            task,
+            component_id,
+            instance_id,
+        } = self;
+        let HttpTask {
+            request,
+            response_tx,
+            in_flight,
+            parent_span,
+        } = task;
+
+        // Mirror the non-stateful executors' span (see `wasip3.rs`): same span
+        // name and `otel.name` format, so a stateful request shows up as
+        // `execute_wasm_component <component>` and is attributed to the
+        // component. Parented to the caller's span so it joins the same trace.
+        // The stateful side has no separate per-request server span (the
+        // `handle_http_request` span belongs to the router, the `send_request`
+        // span to the outbound hop), so record the method and path here too,
+        // making this span self-describing — which `(component, instance)`
+        // served which operation.
+        let span = tracing::info_span!(
+            parent: &parent_span,
+            "spin_trigger_http.execute_wasm",
+            "otel.name" = format!("execute_wasm_component {component_id}"),
+            component_id = %component_id,
+            instance_id = %instance_id,
+            "http.request.method" = %request.method(),
+            "url.path" = %request.uri().path(),
+        );
+
         async move {
-            let HttpTask {
-                request,
-                response_tx,
-                in_flight,
-            } = self.task;
-            match handle_single_request::<F>(accessor, &self.service, self.getter, request).await {
+            match handle_single_request::<F>(accessor, &service, getter, request).await {
                 Ok((response, body_rx)) => {
                     if response_tx.send(Ok(response)).is_ok() {
                         // Keep this spawned task — and therefore the store's
@@ -86,6 +127,7 @@ impl<F: RuntimeFactors> wasmtime::component::AccessorTask<StoreData<F>>
             drop(in_flight);
             Ok(())
         }
+        .instrument(span)
     }
 }
 
@@ -99,6 +141,8 @@ struct ReceiverTask<F: RuntimeFactors> {
     service: Arc<wasmtime_wasi_http::p3::bindings::Service>,
     getter: fn(&mut StoreData<F>) -> WasiHttpCtxView<'_>,
     shutdown: oneshot::Sender<()>,
+    component_id: Arc<str>,
+    instance_id: Arc<str>,
 }
 
 impl<F: RuntimeFactors> wasmtime::component::AccessorTask<StoreData<F>>
@@ -115,6 +159,8 @@ impl<F: RuntimeFactors> wasmtime::component::AccessorTask<StoreData<F>>
                     service: Arc::clone(&self.service),
                     getter: self.getter,
                     task,
+                    component_id: Arc::clone(&self.component_id),
+                    instance_id: Arc::clone(&self.instance_id),
                 });
             }
             let _ = self.shutdown.send(());
@@ -316,6 +362,11 @@ impl<F: RuntimeFactors> StatefulInstanceManager<F> {
             request: req,
             response_tx,
             in_flight,
+            // Capture the caller's span here, on the caller's task (inside the
+            // outbound `send_request` span), so the worker — which runs the
+            // guest on a different task — can parent its `execute_wasm` span to
+            // it and keep the stateful request in the same trace.
+            parent_span: tracing::Span::current(),
         };
         // Bounded send: blocks (backpressure) while the instance is behind, and
         // errors — returning the task — only once the worker has exited.
@@ -528,6 +579,8 @@ async fn run_stateful_worker<F: RuntimeFactors>(
         service: Arc::clone(&service),
         getter,
         shutdown: shutdown_tx,
+        component_id: Arc::from(component_id),
+        instance_id: Arc::from(instance_id),
     };
 
     let run_result = store
