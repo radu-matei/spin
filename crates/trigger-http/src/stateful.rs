@@ -463,11 +463,13 @@ async fn run_stateful_worker<F: RuntimeFactors>(
     tracing::info!(component_id, instance_id, "Starting stateful component instance");
 
     // 1. Prepare store with all host factors. Scope the key-value
-    //    "instance-store" to this instance ID so each stateful instance sees
-    //    isolated data (a no-op if the app has no key-value factor).
+    //    "instance-store" to this (component, instance) pair so each stateful
+    //    instance sees isolated data — and two components that happen to use the
+    //    same instance id don't collide (a no-op if the app has no key-value
+    //    factor).
     let mut builder = trigger_app.prepare(component_id)?;
     if let Some(kv) = builder.factor_builder::<spin_factor_key_value::KeyValueFactor>() {
-        kv.set_instance_id(instance_id.to_string());
+        kv.set_instance_id(format!("{component_id}/{instance_id}"));
     }
     let mut store: wasmtime::Store<StoreData<F>> = builder.instantiate_store(())?.into_inner();
 
