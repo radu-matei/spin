@@ -522,6 +522,11 @@ async fn run_stateful_worker<F: RuntimeFactors>(
     if let Some(kv) = builder.factor_builder::<spin_factor_key_value::KeyValueFactor>() {
         kv.set_instance_id(format!("{component_id}/{instance_id}"));
     }
+    // Likewise scope the SQLite "instance-db" to this (component, instance): with a
+    // Turso-sync backend each instance gets its own local file + remote database.
+    if let Some(sq) = builder.factor_builder::<spin_factor_sqlite::SqliteFactor>() {
+        sq.set_instance_id(format!("{component_id}/{instance_id}"));
+    }
     let mut store: wasmtime::Store<StoreData<F>> = builder.instantiate_store(())?.into_inner();
 
     // 2. Instantiate the Wasm component

@@ -1,0 +1,23 @@
+[package]
+name = "spin-sqlite-turso"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+spin-factor-sqlite = { path = "../factor-sqlite" }
+spin-world = { path = "../world" }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+# The new Turso engine (the from-scratch Rust rewrite of SQLite). The `sync`
+# feature enables local-first writes with background sync to a hosted engine.
+#
+# NOTE: Turso offline sync is BETA — no durability guarantees today, and conflict
+# resolution is not yet implemented. This backend is opt-in (gated behind the
+# `turso` feature of `spin-sqlite`) and is not built into Spin by default.
+turso = { version = "0.7.0-pre.10", features = ["sync"] }
+
+[lints]
+workspace = true

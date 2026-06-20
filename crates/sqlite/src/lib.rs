@@ -104,6 +104,19 @@ impl RuntimeConfigResolver {
                 let config: LibSqlDatabase = config.config.try_into()?;
                 Ok(Arc::new(config.connection_creator()?))
             }
+            "turso" => {
+                #[cfg(feature = "turso")]
+                {
+                    let config: TursoDatabase = config.config.try_into()?;
+                    config.connection_creator(&self.local_database_dir)
+                }
+                #[cfg(not(feature = "turso"))]
+                {
+                    anyhow::bail!(
+                        "the 'turso' SQLite backend is not enabled in this build of Spin; rebuild with the `turso` feature"
+                    )
+                }
+            }
             _ => anyhow::bail!("Unknown database kind: {database_kind}"),
         }
     }
@@ -209,6 +222,56 @@ impl LibSqlDatabase {
             Ok(Arc::new(connection) as _)
         };
         Ok(factory)
+    }
+}
+
+/// Configuration for a Turso local-first synced database.
+///
+/// All reads/writes hit a local SQLite file; the Turso engine syncs it to the
+/// hosted database at `url`. For stateful components, the connection creator is
+/// scoped per `(component, instance)` (see
+/// [`spin_factor_sqlite::ConnectionCreator::scoped_to_instance`]), giving each
+/// instance its own local file and remote database.
+#[cfg(feature = "turso")]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TursoDatabase {
+    /// URL of the remote/hosted Turso engine to sync with.
+    url: String,
+    /// Auth token for the remote.
+    token: String,
+    /// Directory (resolved relative to the runtime-config/state dir) under which
+    /// per-instance local database files are created.
+    #[serde(default = "default_turso_local_dir")]
+    local_dir: PathBuf,
+    /// Background sync interval, in seconds. `0` (the default) disables periodic
+    /// sync (a sync still happens once when the database is opened).
+    #[serde(default)]
+    sync_interval_seconds: u64,
+}
+
+#[cfg(feature = "turso")]
+fn default_turso_local_dir() -> PathBuf {
+    PathBuf::from("turso-instance-dbs")
+}
+
+#[cfg(feature = "turso")]
+impl TursoDatabase {
+    fn connection_creator(self, base_dir: &Path) -> anyhow::Result<Arc<dyn ConnectionCreator>> {
+        let url = check_url(&self.url)
+            .with_context(|| {
+                format!("unexpected Turso URL '{}' in runtime config file", self.url)
+            })?
+            .to_owned();
+        let local_dir = resolve_relative_path(&self.local_dir, base_dir);
+        let sync_interval = (self.sync_interval_seconds > 0)
+            .then(|| std::time::Duration::from_secs(self.sync_interval_seconds));
+        Ok(Arc::new(spin_sqlite_turso::TursoConnectionCreator::new(
+            local_dir,
+            url,
+            self.token,
+            sync_interval,
+        )))
     }
 }
 

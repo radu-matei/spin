@@ -171,6 +171,14 @@ impl AppState {
     }
 }
 
+/// The well-known database label that stateful components use for their
+/// per-instance database.
+///
+/// When a stateful worker calls [`InstanceState::set_instance_id`], the creator for
+/// this label is replaced with its [`ConnectionCreator::scoped_to_instance`]
+/// per-instance variant, so each `(component, instance)` gets its own database.
+pub const INSTANCE_DB_LABEL: &str = "instance-db";
+
 /// A creator of a connections for a particular SQLite database.
 #[async_trait]
 pub trait ConnectionCreator: Send + Sync {
@@ -181,6 +189,18 @@ pub trait ConnectionCreator: Send + Sync {
         &self,
         label: &str,
     ) -> Result<Arc<dyn Connection + 'static>, v3::Error>;
+
+    /// Return a connection creator scoped to a specific stateful-component
+    /// instance, or `None` if this backend does not support per-instance databases.
+    ///
+    /// Unlike key-value (which isolates instances by key-prefixing one shared
+    /// store), a per-instance SQLite database is a *separate* database. Backends
+    /// that can provide one — e.g. Turso sync, which derives a per-instance local
+    /// file and remote database — override this. The default returns `None`.
+    fn scoped_to_instance(&self, instance_id: &str) -> Option<Arc<dyn ConnectionCreator>> {
+        let _ = instance_id;
+        None
+    }
 }
 
 #[async_trait]

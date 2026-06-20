@@ -10,4 +10,11 @@ spin-factor-sqlite = { path = "../factor-sqlite" }
 spin-factors = { path = "../factors" }
 spin-sqlite-inproc = { path = "../sqlite-inproc" }
 spin-sqlite-libsql = { path = "../sqlite-libsql" }
+spin-sqlite-turso = { path = "../sqlite-turso", optional = true }
 toml = { workspace = true }
+
+[features]
+# Opt-in support for the Turso local-first sync backend (`type = "turso"`). Off by
+# default because the underlying Turso engine's offline sync is beta (no durability
+# guarantees yet) and pulls a large dependency tree.
+turso = ["dep:spin-sqlite-turso"]

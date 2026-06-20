@@ -121,6 +121,9 @@ llm-cublas = ["llm", "spin-runtime-factors/llm-cublas"]
 # This enables the collection and emission CPU time elapsed per component execution.
 cpu-time-metrics = ["spin-factors-executor/cpu-time-metrics"]
 experimental-wasm-features = ["spin-trigger/experimental-wasm-features"]
+# Opt-in Turso local-first sync SQLite backend (`type = "turso"`). Beta: the
+# underlying Turso offline sync has no durability guarantees yet.
+turso = ["spin-runtime-factors/turso"]
 
 [workspace]
 members = [

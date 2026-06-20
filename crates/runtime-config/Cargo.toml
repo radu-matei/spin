@@ -8,6 +8,10 @@ homepage.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# Opt-in Turso local-first sync SQLite backend (`type = "turso"`).
+turso = ["spin-sqlite/turso"]
+
 [dependencies]
 anyhow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

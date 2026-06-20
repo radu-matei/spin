@@ -12,6 +12,8 @@ rust-version.workspace = true
 llm = ["spin-factor-llm/llm"]
 llm-metal = ["spin-factor-llm/llm-metal"]
 llm-cublas = ["spin-factor-llm/llm-cublas"]
+# Opt-in Turso local-first sync SQLite backend (`type = "turso"`).
+turso = ["spin-runtime-config/turso"]
 
 [dependencies]
 anyhow = { workspace = true }

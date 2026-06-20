@@ -91,6 +91,23 @@ impl InstanceState {
     pub fn allowed_databases(&self) -> &HashSet<String> {
         &self.allowed_databases
     }
+
+    /// Scope the [`INSTANCE_DB_LABEL`](crate::INSTANCE_DB_LABEL) database to the
+    /// given stateful-component instance, so each long-lived instance gets its own
+    /// database.
+    ///
+    /// Used by stateful components: the worker passes `"{component}/{instance}"`.
+    /// A no-op if there is no `instance-db` connection creator, or its backend does
+    /// not support per-instance scoping (see
+    /// [`ConnectionCreator::scoped_to_instance`]).
+    pub fn set_instance_id(&mut self, instance_id: String) {
+        if let Some(creator) = self.connection_creators.get(crate::INSTANCE_DB_LABEL) {
+            if let Some(scoped) = creator.scoped_to_instance(&instance_id) {
+                self.connection_creators
+                    .insert(crate::INSTANCE_DB_LABEL.to_owned(), scoped);
+            }
+        }
+    }
 }
 
 impl SelfInstanceBuilder for InstanceState {}
