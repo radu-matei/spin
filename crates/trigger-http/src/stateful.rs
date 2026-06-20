@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use http_body_util::BodyExt;
-use spin_factors::RuntimeFactors;
+use spin_factors::{RuntimeFactors, RuntimeFactorsInstanceState};
 use spin_factors_executor::InstanceState;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::Instrument as _;
@@ -610,6 +610,26 @@ async fn run_stateful_worker<F: RuntimeFactors>(
             instance_id,
             "lifecycle::suspend failed: {e:?}"
         );
+    }
+
+    // 8. Flush local-first SQLite databases (e.g. Turso sync) to their remote now
+    //    that the instance has suspended, so any writes (including ones made in
+    //    `suspend()`) are pushed before the instance is dropped. Grab the
+    //    connections, then await outside the store borrow.
+    let to_sync = store
+        .data_mut()
+        .factors_instance_state_mut()
+        .get::<spin_factor_sqlite::SqliteFactor>()
+        .map(|s| s.connections_to_sync())
+        .unwrap_or_default();
+    for conn in to_sync {
+        if let Err(e) = conn.sync().await {
+            tracing::warn!(
+                component_id,
+                instance_id,
+                "sqlite sync on suspend failed: {e:?}"
+            );
+        }
     }
 
     Ok(())

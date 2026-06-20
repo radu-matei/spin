@@ -225,29 +225,61 @@ impl LibSqlDatabase {
     }
 }
 
+/// How a Turso database provisions its per-instance remote databases.
+#[cfg(feature = "turso")]
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TursoProvision {
+    /// The hosted engine creates the per-instance database automatically on first
+    /// sync (e.g. a turso-auto-style server, or your own sync server). Requires
+    /// `url`. This is the default.
+    #[default]
+    Auto,
+    /// Create each per-instance database via the Turso Platform API (Turso Cloud).
+    Platform,
+}
+
 /// Configuration for a Turso local-first synced database.
 ///
-/// All reads/writes hit a local SQLite file; the Turso engine syncs it to the
-/// hosted database at `url`. For stateful components, the connection creator is
-/// scoped per `(component, instance)` (see
+/// All reads/writes hit a local SQLite file; the Turso engine syncs it to a hosted
+/// database. For stateful components, the connection creator is scoped per
+/// `(component, instance)` (see
 /// [`spin_factor_sqlite::ConnectionCreator::scoped_to_instance`]), giving each
-/// instance its own local file and remote database.
+/// instance its own local file and remote database, obtained via the configured
+/// provisioner.
 #[cfg(feature = "turso")]
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TursoDatabase {
-    /// URL of the remote/hosted Turso engine to sync with.
-    url: String,
-    /// Auth token for the remote.
-    token: String,
+    /// How per-instance remote databases are provisioned.
+    #[serde(default)]
+    provision: TursoProvision,
+    /// Base remote URL of the hosted Turso engine (required for `provision = "auto"`;
+    /// e.g. `http://127.0.0.1:8080` for a local `turso dev`).
+    url: Option<String>,
+    /// Auth token for the remote (optional; a local `turso dev` needs none).
+    token: Option<String>,
     /// Directory (resolved relative to the runtime-config/state dir) under which
     /// per-instance local database files are created.
     #[serde(default = "default_turso_local_dir")]
     local_dir: PathBuf,
     /// Background sync interval, in seconds. `0` (the default) disables periodic
-    /// sync (a sync still happens once when the database is opened).
+    /// sync (a sync still happens on open and on suspend).
     #[serde(default)]
     sync_interval_seconds: u64,
+    /// Turso Platform API base URL (default `https://api.turso.tech`).
+    api_url: Option<String>,
+    /// Organization slug (for `provision = "platform"`).
+    org: Option<String>,
+    /// Group name (for `provision = "platform"`).
+    group: Option<String>,
+    /// Platform API token (for `provision = "platform"`).
+    api_token: Option<String>,
+    /// Sync-URL template with `{db}`/`{org}` placeholders (default
+    /// `libsql://{db}-{org}.turso.io`).
+    url_template: Option<String>,
+    /// Token used to sync to a provisioned database (for `provision = "platform"`).
+    db_token: Option<String>,
 }
 
 #[cfg(feature = "turso")]
@@ -258,18 +290,46 @@ fn default_turso_local_dir() -> PathBuf {
 #[cfg(feature = "turso")]
 impl TursoDatabase {
     fn connection_creator(self, base_dir: &Path) -> anyhow::Result<Arc<dyn ConnectionCreator>> {
-        let url = check_url(&self.url)
-            .with_context(|| {
-                format!("unexpected Turso URL '{}' in runtime config file", self.url)
-            })?
-            .to_owned();
+        use spin_sqlite_turso::{
+            AutoCreateProvisioner, RemoteProvisioner, TursoConnectionCreator,
+            TursoPlatformProvisioner,
+        };
+
         let local_dir = resolve_relative_path(&self.local_dir, base_dir);
         let sync_interval = (self.sync_interval_seconds > 0)
             .then(|| std::time::Duration::from_secs(self.sync_interval_seconds));
-        Ok(Arc::new(spin_sqlite_turso::TursoConnectionCreator::new(
+
+        let provisioner: Arc<dyn RemoteProvisioner> = match self.provision {
+            TursoProvision::Auto => {
+                let url = self
+                    .url
+                    .context("a Turso database with provision = \"auto\" requires a `url`")?;
+                let url = check_url(&url)
+                    .with_context(|| format!("unexpected Turso URL '{url}' in runtime config file"))?
+                    .to_owned();
+                Arc::new(AutoCreateProvisioner {
+                    base_url: url,
+                    token: self.token,
+                })
+            }
+            TursoProvision::Platform => Arc::new(TursoPlatformProvisioner::new(
+                self.api_url
+                    .unwrap_or_else(|| "https://api.turso.tech".to_owned()),
+                self.org
+                    .context("provision = \"platform\" requires `org`")?,
+                self.group
+                    .context("provision = \"platform\" requires `group`")?,
+                self.api_token
+                    .context("provision = \"platform\" requires `api_token`")?,
+                self.url_template
+                    .unwrap_or_else(|| "libsql://{db}-{org}.turso.io".to_owned()),
+                self.db_token,
+            )),
+        };
+
+        Ok(Arc::new(TursoConnectionCreator::new(
             local_dir,
-            url,
-            self.token,
+            provisioner,
             sync_interval,
         )))
     }

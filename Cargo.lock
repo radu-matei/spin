@@ -10481,6 +10481,8 @@ version = "4.1.0-pre0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "reqwest 0.12.9",
+ "serde_json",
  "spin-factor-sqlite",
  "spin-world",
  "tokio",

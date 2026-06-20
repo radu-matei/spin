@@ -79,18 +79,56 @@ database — which the hosted engine is expected to create on first sync.)
 - **Periodic** — a background task pushes+pulls every `sync_interval_seconds`
   while the connection is alive (it stops, via a `Weak` ref, when the instance is
   suspended/evicted).
+- **Push on suspend** — when a stateful instance is suspended/evicted, the host
+  worker flushes each of the instance's open connections to the remote (via the
+  `Connection::sync()` hook → Turso `push()`), so writes are durable before the
+  instance is dropped.
 
-## Not yet done (follow-ups)
+## Provisioning the per-instance remote database
 
-- **Push on suspend.** The host worker should drive a final `push()` right after
-  `lifecycle::suspend()` for prompt durability on idle. This needs a `sync()` hook
-  on the `Connection` trait + a way to enumerate an instance's open connections
-  from the worker; periodic sync currently approximates it.
-- **Remote auto-provisioning.** The Turso crate does **not** auto-create the
-  remote database on first sync. Realizing "one auto-created DB per instance"
-  needs either a self-hosted sync server that provisions on demand, or a
-  `RemoteProvisioner` hook that calls the Turso Platform API. Today the remote
-  must already exist (or be created by the hosted engine).
-- **End-to-end test** against a running Turso sync server.
+Each instance needs its own remote database. The Turso crate does **not**
+auto-create it, so the backend obtains it through a `RemoteProvisioner` selected
+by the `provision` config field:
+
+- **`provision = "auto"` (default)** — assumes the hosted engine creates the
+  database automatically on first sync (a `turso-auto`-style server, or your own
+  sync server). The per-instance URL is the base `url` with the instance name as a
+  path segment. This matches "creation is automatic on sync".
+- **`provision = "platform"`** — creates each per-instance database via the Turso
+  **Platform API** (`POST /v1/organizations/{org}/databases`, idempotent) for
+  Turso Cloud. Requires `org`, `group`, `api_token`; the sync URL is built from
+  `url_template` (`{db}`/`{org}` placeholders, default
+  `libsql://{db}-{org}.turso.io`).
+
+## Local testing
+
+Run a local Turso sync server (no Turso Cloud account needed):
+
+```bash
+curl -sSfL https://get.turso.tech/install.sh | bash   # installs `turso`/`tursodb`
+turso dev                                              # serves http://127.0.0.1:8080, no auth
+```
+
+Point the backend at it (no token needed):
+
+```toml
+[sqlite_database.instance-db]
+type = "turso"
+provision = "auto"
+url = "http://127.0.0.1:8080"
+sync_interval_seconds = 5
+```
+
+The local server hosts a **single** database (dynamic per-name creation locally is
+a known open Turso limitation), so locally you can fully exercise **one** instance.
+For multi-instance remote isolation, run one `turso dev` per instance on different
+ports, or use Turso Cloud with `provision = "platform"`.
+
+## Still beta / to verify
+
+- Live end-to-end isolation across many instances + the exact Turso Cloud URL/token
+  shape for `provision = "platform"` (built from a template today).
+- Conflict resolution (Turso detects but does not yet resolve) and durability — do
+  not use in production yet.
 
 [Turso]: https://github.com/tursodatabase/turso

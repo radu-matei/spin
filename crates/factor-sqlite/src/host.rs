@@ -19,6 +19,10 @@ pub struct InstanceState {
     allowed_databases: Arc<HashSet<String>>,
     /// A resource table of connections.
     connections: spin_resource_table::Table<Arc<dyn Connection>>,
+    /// Every connection opened by this instance, retained so the host can flush
+    /// them on suspend (the resource table cannot be iterated). See
+    /// [`connections_to_sync`](Self::connections_to_sync).
+    open_connections: Vec<Arc<dyn Connection>>,
     /// A map from database label to connection creators.
     connection_creators: HashMap<String, Arc<dyn ConnectionCreator>>,
     otel: OtelFactorState,
@@ -36,6 +40,7 @@ impl InstanceState {
         Self {
             allowed_databases,
             connections: spin_resource_table::Table::new(256),
+            open_connections: Vec::new(),
             connection_creators,
             otel,
         }
@@ -66,6 +71,7 @@ impl InstanceState {
             "sqlite.backend",
             conn.summary().as_deref().unwrap_or("unknown"),
         );
+        self.open_connections.push(conn.clone());
         self.connections
             .push(conn)
             .map_err(|()| v3::Error::Io("too many connections opened".to_string()))
@@ -90,6 +96,14 @@ impl InstanceState {
     /// Get the set of allowed databases.
     pub fn allowed_databases(&self) -> &HashSet<String> {
         &self.allowed_databases
+    }
+
+    /// The connections this instance has opened, for the host to
+    /// [`sync`](Connection::sync) (flush) — e.g. when a stateful instance is
+    /// suspended. Returns clones so the caller can `await` without holding the
+    /// instance-state borrow.
+    pub fn connections_to_sync(&self) -> Vec<Arc<dyn Connection>> {
+        self.open_connections.clone()
     }
 
     /// Scope the [`INSTANCE_DB_LABEL`](crate::INSTANCE_DB_LABEL) database to the
@@ -194,6 +208,7 @@ impl v3::HostConnectionWithStore for crate::SqliteFactorData {
 
         accessor.with(|mut access| {
             let host = access.get();
+            host.open_connections.push(conn.clone());
             host.connections
                 .push(conn)
                 .map_err(|()| v3::Error::Io("too many connections opened".to_string()))

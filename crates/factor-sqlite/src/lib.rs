@@ -246,6 +246,16 @@ pub trait Connection: Send + Sync {
     fn summary(&self) -> Option<String> {
         None
     }
+
+    /// Flush any locally-buffered changes to a durable/remote backend.
+    ///
+    /// A no-op for backends that are already durable (e.g. local files) or that
+    /// manage their own write schedule. The Turso sync backend implements this to
+    /// `push` the local replica to its remote; the stateful worker calls it when an
+    /// instance is suspended so a local-first database is flushed before eviction.
+    async fn sync(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 pub struct QueryAsyncResult {
