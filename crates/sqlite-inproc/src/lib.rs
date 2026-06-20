@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::Context as _;
 use async_trait::async_trait;
-use spin_factor_sqlite::{Connection, QueryAsyncResult};
+use spin_factor_sqlite::{Connection, ConnectionCreator, QueryAsyncResult};
 use spin_world::spin::sqlite3_1_0::sqlite;
 use spin_world::spin::sqlite3_1_0::sqlite::{self as v3};
 
@@ -217,6 +217,75 @@ impl Connection for InProcConnection {
             InProcDatabaseLocation::Path(path) => format!("\"{}\"", path.display()),
         })
     }
+}
+
+/// Creates [`InProcConnection`]s, with optional per-instance scoping.
+///
+/// For a stateful component's instance database, [`scoped_to_instance`] derives a
+/// per-instance file from the base path (`<base-without-ext>/<instance>.db`), so
+/// each `(component, instance)` gets its own local SQLite file — per-instance
+/// isolation without any sync. In-memory databases are not instance-scopable.
+///
+/// [`scoped_to_instance`]: ConnectionCreator::scoped_to_instance
+#[derive(Clone)]
+pub struct InProcConnectionCreator {
+    /// Base file path. `None` means an in-memory database.
+    path: Option<PathBuf>,
+    allow_attach_file: bool,
+    /// `Some("{component}/{instance}")` for an instance-scoped creator.
+    instance_id: Option<String>,
+}
+
+impl InProcConnectionCreator {
+    pub fn new(path: Option<PathBuf>, allow_attach_file: bool) -> Self {
+        Self {
+            path,
+            allow_attach_file,
+            instance_id: None,
+        }
+    }
+
+    fn location(&self) -> anyhow::Result<InProcDatabaseLocation> {
+        match (&self.path, &self.instance_id) {
+            (Some(base), Some(id)) => {
+                let dir = base.with_extension("");
+                let file = dir.join(format!("{}.db", sanitize_instance(id)));
+                InProcDatabaseLocation::from_path(Some(file))
+            }
+            (Some(base), None) => InProcDatabaseLocation::from_path(Some(base.clone())),
+            (None, _) => InProcDatabaseLocation::from_path(None),
+        }
+    }
+}
+
+#[async_trait]
+impl ConnectionCreator for InProcConnectionCreator {
+    async fn create_connection(
+        &self,
+        _label: &str,
+    ) -> Result<Arc<dyn Connection + 'static>, v3::Error> {
+        let location = self.location().map_err(|e| v3::Error::Io(e.to_string()))?;
+        let connection = InProcConnection::new(location, self.allow_attach_file)?;
+        Ok(Arc::new(connection))
+    }
+
+    fn scoped_to_instance(&self, instance_id: &str) -> Option<Arc<dyn ConnectionCreator>> {
+        // Only file-backed databases can be split per instance.
+        self.path.as_ref()?;
+        let mut scoped = self.clone();
+        scoped.instance_id = Some(instance_id.to_owned());
+        Some(Arc::new(scoped))
+    }
+}
+
+/// Make an instance id safe to use as a file name.
+fn sanitize_instance(id: &str) -> String {
+    id.chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => c,
+            _ => '_',
+        })
+        .collect()
 }
 
 fn io_error_v3(err: rusqlite::Error) -> v3::Error {

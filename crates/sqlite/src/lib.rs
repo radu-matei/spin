@@ -12,7 +12,7 @@ use spin_factors::{
     anyhow::{self, Context as _},
     runtime_config::toml::GetTomlValue,
 };
-use spin_sqlite_inproc::InProcDatabaseLocation;
+use spin_sqlite_inproc::InProcConnectionCreator;
 use spin_sqlite_libsql::LazyLibSqlConnection;
 
 /// Spin's default resolution of runtime configuration for SQLite databases.
@@ -137,12 +137,7 @@ impl RuntimeConfigResolver {
             .default_database_dir
             .as_deref()
             .map(|p| p.join(DEFAULT_SQLITE_DB_FILENAME));
-        let factory = move || {
-            let location = InProcDatabaseLocation::from_path(path.clone())?;
-            let connection = spin_sqlite_inproc::InProcConnection::new(location, false)?;
-            Ok(Arc::new(connection) as _)
-        };
-        Arc::new(factory)
+        Arc::new(InProcConnectionCreator::new(path, false))
     }
 }
 
@@ -174,15 +169,7 @@ impl InProcDatabase {
             .path
             .as_ref()
             .map(|p| resolve_relative_path(p, base_dir));
-        let location = InProcDatabaseLocation::from_path(path)?;
-        let factory = move || {
-            let connection = spin_sqlite_inproc::InProcConnection::new(
-                location.clone(),
-                self.allow_attach_file,
-            )?;
-            Ok(Arc::new(connection) as _)
-        };
-        Ok(factory)
+        Ok(InProcConnectionCreator::new(path, self.allow_attach_file))
     }
 }
 
