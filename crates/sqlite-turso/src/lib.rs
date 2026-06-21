@@ -39,6 +39,10 @@ use tokio::sync::{Mutex, OnceCell};
 pub struct RemoteTarget {
     pub url: String,
     pub token: Option<String>,
+    /// `true` if this call *just created* the remote database (so it is empty and
+    /// the local replica is the source of truth — push-first, never bootstrap);
+    /// `false` if it already existed (a cold local replica should bootstrap from it).
+    pub created: bool,
 }
 
 /// Ensures a per-instance remote database exists and returns how to sync to it.
@@ -68,6 +72,9 @@ impl RemoteProvisioner for AutoCreateProvisioner {
         Ok(RemoteTarget {
             url: self.base_url.clone(),
             token: self.token.clone(),
+            // A single-db server is pre-existing infrastructure, not created here;
+            // a cold local replica should bootstrap from whatever it holds.
+            created: false,
         })
     }
 }
@@ -121,8 +128,11 @@ impl TursoPlatformProvisioner {
         self.api_url.trim_end_matches('/')
     }
 
-    /// Create the database if needed (idempotent) and return its hostname.
-    async fn ensure_database(&self, name: &str) -> anyhow::Result<String> {
+    /// Create the database if needed (idempotent) and return its hostname plus
+    /// whether this call actually created it (`true`) or it already existed
+    /// (`false`). The created flag decides whether a cold local replica should
+    /// bootstrap from the remote (existing) or push-first (just created, empty).
+    async fn ensure_database(&self, name: &str) -> anyhow::Result<(String, bool)> {
         let resp = self
             .http
             .post(format!("{}/v1/organizations/{}/databases", self.api(), self.org))
@@ -133,11 +143,11 @@ impl TursoPlatformProvisioner {
             .context("Turso Platform API: create database request failed")?;
         let status = resp.status();
         if status.is_success() {
-            return parse_hostname(resp).await;
+            return Ok((parse_hostname(resp).await?, true));
         }
         // 409 (and some deployments 400) == already exists: fetch it instead.
         if status.as_u16() == 409 || status.as_u16() == 400 {
-            return self.get_database_hostname(name).await;
+            return Ok((self.get_database_hostname(name).await?, false));
         }
         let body = resp.text().await.unwrap_or_default();
         anyhow::bail!("Turso Platform API: creating database '{name}' failed ({status}): {body}");
@@ -192,7 +202,7 @@ impl RemoteProvisioner for TursoPlatformProvisioner {
             return Ok(target.clone());
         }
         let cloud_name = cloud_db_name(&self.name_prefix, db_name);
-        let hostname = self.ensure_database(&cloud_name).await?;
+        let (hostname, created) = self.ensure_database(&cloud_name).await?;
         let token = match &self.db_token {
             Some(t) => Some(t.clone()),
             None => Some(self.mint_token(&cloud_name).await?),
@@ -202,6 +212,7 @@ impl RemoteProvisioner for TursoPlatformProvisioner {
         let target = RemoteTarget {
             url: format!("libsql://{hostname}"),
             token,
+            created,
         };
         self.cache
             .lock()
@@ -312,6 +323,10 @@ pub struct TursoConnectionCreator {
     sync_interval: Option<Duration>,
     /// `Some("{component}/{instance}")` for an instance-scoped creator.
     instance_id: Option<String>,
+    /// For an instance-scoped creator, the shared cell that the activation-time
+    /// warm-up populates and that every connection from this creator reads, so the
+    /// first request joins an in-flight open. `None` for the base creator.
+    warm: Option<Arc<OnceCell<Arc<TursoConnection>>>>,
 }
 
 impl TursoConnectionCreator {
@@ -325,6 +340,7 @@ impl TursoConnectionCreator {
             provisioner,
             sync_interval,
             instance_id: None,
+            warm: None,
         }
     }
 
@@ -348,17 +364,54 @@ impl ConnectionCreator for TursoConnectionCreator {
         &self,
         _label: &str,
     ) -> Result<Arc<dyn Connection + 'static>, v3::Error> {
+        // An instance-scoped creator shares one warm-up cell across all its
+        // connections (so they join the activation-time open); the base creator
+        // gives each connection its own cell (lazy on first use).
+        let inner = self
+            .warm
+            .clone()
+            .unwrap_or_else(|| Arc::new(OnceCell::new()));
         Ok(Arc::new(LazyTursoConnection::new(
             self.local_path(),
             Arc::clone(&self.provisioner),
             self.db_name(),
             self.sync_interval,
+            inner,
         )))
     }
 
     fn scoped_to_instance(&self, instance_id: &str) -> Option<Arc<dyn ConnectionCreator>> {
         let mut scoped = self.clone();
         scoped.instance_id = Some(instance_id.to_owned());
+        let cell: Arc<OnceCell<Arc<TursoConnection>>> = Arc::new(OnceCell::new());
+        scoped.warm = Some(cell.clone());
+
+        // Warm up at activation: provisioning the Cloud database is a one-time
+        // control-plane round-trip that must finish before the local synced db can
+        // be built (the crate needs the remote URL at build time). Kicking it off
+        // here — when the stateful instance is activated, before its first HTTP
+        // request — overlaps it with Wasm instantiation, so by the time the guest
+        // first opens `instance-db` the connection is ready (or the request simply
+        // joins the in-flight open via the shared cell). Best-effort: on failure the
+        // first real use retries through the same cell.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let provisioner = Arc::clone(&scoped.provisioner);
+            let local_path = scoped.local_path();
+            let db_name = scoped.db_name();
+            let sync_interval = scoped.sync_interval;
+            handle.spawn(async move {
+                if let Err(e) = cell
+                    .get_or_try_init(|| {
+                        build_connection(provisioner, local_path, db_name, sync_interval)
+                    })
+                    .await
+                {
+                    tracing::debug!(
+                        "Turso instance database warm-up failed (will retry on first use): {e:#}"
+                    );
+                }
+            });
+        }
         Some(Arc::new(scoped))
     }
 }
@@ -388,7 +441,10 @@ pub struct LazyTursoConnection {
     provisioner: Arc<dyn RemoteProvisioner>,
     db_name: String,
     sync_interval: Option<Duration>,
-    inner: OnceCell<TursoConnection>,
+    /// The built connection. Shared with the creator's activation-time warm-up
+    /// task (see [`TursoConnectionCreator::scoped_to_instance`]) so the first
+    /// request joins an already-in-flight open instead of starting it cold.
+    inner: Arc<OnceCell<Arc<TursoConnection>>>,
 }
 
 impl LazyTursoConnection {
@@ -397,34 +453,29 @@ impl LazyTursoConnection {
         provisioner: Arc<dyn RemoteProvisioner>,
         db_name: String,
         sync_interval: Option<Duration>,
+        inner: Arc<OnceCell<Arc<TursoConnection>>>,
     ) -> Self {
         Self {
             local_path,
             provisioner,
             db_name,
             sync_interval,
-            inner: OnceCell::new(),
+            inner,
         }
     }
 
-    async fn get_or_create_connection(&self) -> Result<&TursoConnection, v3::Error> {
+    async fn get_or_create_connection(&self) -> Result<Arc<TursoConnection>, v3::Error> {
         self.inner
-            .get_or_try_init(|| async {
-                let target = self
-                    .provisioner
-                    .ensure(&self.db_name)
-                    .await
-                    .context("failed to provision remote Turso database")?;
-                TursoConnection::create(
+            .get_or_try_init(|| {
+                build_connection(
+                    self.provisioner.clone(),
                     self.local_path.clone(),
-                    target.url,
-                    target.token,
+                    self.db_name.clone(),
                     self.sync_interval,
                 )
-                .await
-                .context("failed to create Turso synced database")
             })
             .await
+            .map(Arc::clone)
             .map_err(|e| {
                 // The guest only sees `InvalidConnection`; log the real cause
                 // (provisioning / Platform API / sync errors) so it is diagnosable.
@@ -432,6 +483,37 @@ impl LazyTursoConnection {
                 v3::Error::InvalidConnection
             })
     }
+}
+
+/// Provision the remote (if needed) and open the per-instance synced database.
+/// Shared by the lazy first-use path and the activation-time warm-up.
+async fn build_connection(
+    provisioner: Arc<dyn RemoteProvisioner>,
+    local_path: PathBuf,
+    db_name: String,
+    sync_interval: Option<Duration>,
+) -> anyhow::Result<Arc<TursoConnection>> {
+    let local_absent = !local_path.exists();
+    let target = provisioner
+        .ensure(&db_name)
+        .await
+        .context("failed to provision remote Turso database")?;
+    // Bootstrap (download) from the remote only when restoring a COLD local replica
+    // of a PRE-EXISTING database. A just-created remote is empty (push-first), and a
+    // present local file is already the source of truth — bootstrapping either would
+    // block on the network and, against a not-yet-ready new remote, can even drop the
+    // first write (it rebases the fresh local WAL onto the empty remote).
+    let bootstrap = local_absent && !target.created;
+    let conn = TursoConnection::create(
+        local_path,
+        target.url,
+        target.token,
+        sync_interval,
+        bootstrap,
+    )
+    .await
+    .context("failed to create Turso synced database")?;
+    Ok(Arc::new(conn))
 }
 
 #[async_trait]
@@ -519,31 +601,26 @@ impl TursoConnection {
         remote_url: String,
         token: Option<String>,
         sync_interval: Option<Duration>,
+        bootstrap: bool,
     ) -> anyhow::Result<Self> {
         if let Some(parent) = local_path.parent() {
             tokio::fs::create_dir_all(parent).await.ok();
         }
 
-        // Whether this is the first time we open this per-instance local file.
-        // A stateful instance is the *single writer* of its database, so once a
-        // local replica exists it is authoritative — pulling would revert
-        // un-pushed local writes (Turso's offline pull rebases the local WAL onto
-        // the remote). We therefore only bootstrap-pull when the local file is new.
-        let is_fresh = !local_path.exists();
-
-        let mut builder =
-            turso::sync::Builder::new_remote(&local_path.to_string_lossy()).with_remote_url(&remote_url);
+        // `bootstrap_if_empty(false)` makes `build()` do **zero network I/O** — it
+        // writes only local sync metadata and opens the local file, so the first
+        // write hits the local WAL with no dependency on the remote being reachable
+        // or ready. We enable bootstrap only to restore a cold local replica from a
+        // pre-existing remote (decided by the caller via `build_connection`). All
+        // other syncing is explicit (`push` periodically / on suspend); the crate
+        // does no implicit background sync.
+        let mut builder = turso::sync::Builder::new_remote(&local_path.to_string_lossy())
+            .with_remote_url(&remote_url)
+            .bootstrap_if_empty(bootstrap);
         if let Some(token) = &token {
             builder = builder.with_auth_token(token);
         }
         let db = Arc::new(builder.build().await?);
-
-        // Bootstrap the local replica from the remote only on first open (warm a
-        // fresh instance, or restore after the local file was wiped). Best-effort:
-        // a brand-new remote may be empty/just-created.
-        if is_fresh {
-            let _ = db.pull().await;
-        }
 
         let conn = db.connect().await?;
 
