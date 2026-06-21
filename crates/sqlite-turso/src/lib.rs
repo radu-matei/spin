@@ -425,7 +425,12 @@ impl LazyTursoConnection {
                 .context("failed to create Turso synced database")
             })
             .await
-            .map_err(|_| v3::Error::InvalidConnection)
+            .map_err(|e| {
+                // The guest only sees `InvalidConnection`; log the real cause
+                // (provisioning / Platform API / sync errors) so it is diagnosable.
+                tracing::error!("Turso instance database setup failed: {e:#}");
+                v3::Error::InvalidConnection
+            })
     }
 }
 
@@ -467,7 +472,11 @@ impl Connection for LazyTursoConnection {
     }
 
     async fn last_insert_rowid(&self) -> Result<i64, sqlite::Error> {
-        Ok(self.get_or_create_connection().await?.last_insert_rowid())
+        Ok(self
+            .get_or_create_connection()
+            .await?
+            .last_insert_rowid()
+            .await)
     }
 
     fn summary(&self) -> Option<String> {
@@ -497,6 +506,11 @@ pub struct TursoConnection {
     /// Retained so we can `push`/`pull`. Shared with the background sync task.
     db: Arc<turso::sync::Database>,
     conn: turso::Connection,
+    /// Serializes all access to the turso database. A turso connection/database
+    /// cannot be used concurrently ("concurrent use forbidden"), so every query,
+    /// execute, and push must hold this gate — otherwise the background push task
+    /// races foreground queries and can revert in-flight writes.
+    gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl TursoConnection {
@@ -510,6 +524,13 @@ impl TursoConnection {
             tokio::fs::create_dir_all(parent).await.ok();
         }
 
+        // Whether this is the first time we open this per-instance local file.
+        // A stateful instance is the *single writer* of its database, so once a
+        // local replica exists it is authoritative — pulling would revert
+        // un-pushed local writes (Turso's offline pull rebases the local WAL onto
+        // the remote). We therefore only bootstrap-pull when the local file is new.
+        let is_fresh = !local_path.exists();
+
         let mut builder =
             turso::sync::Builder::new_remote(&local_path.to_string_lossy()).with_remote_url(&remote_url);
         if let Some(token) = &token {
@@ -517,38 +538,46 @@ impl TursoConnection {
         }
         let db = Arc::new(builder.build().await?);
 
-        // Warm the local replica from the remote on open (pull on "instantiate").
-        // Best-effort: a brand-new remote may be empty/just-created.
-        let _ = db.pull().await;
+        // Bootstrap the local replica from the remote only on first open (warm a
+        // fresh instance, or restore after the local file was wiped). Best-effort:
+        // a brand-new remote may be empty/just-created.
+        if is_fresh {
+            let _ = db.pull().await;
+        }
 
         let conn = db.connect().await?;
 
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+
         // Periodic background sync while this connection is alive. A `Weak` ref so
         // the task stops (and the database is freed) once the connection is
-        // dropped — e.g. when the stateful instance is suspended/evicted.
+        // dropped — e.g. when the stateful instance is suspended/evicted. This is
+        // push-only: the instance is the single writer, so there is nothing to
+        // pull, and pulling would revert local writes not yet pushed. The push
+        // holds `gate` so it never overlaps a foreground query.
         if let Some(interval) = sync_interval {
             let db = Arc::downgrade(&db);
+            let gate = gate.clone();
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(interval);
                 ticker.tick().await; // consume the immediate first tick
                 loop {
                     ticker.tick().await;
                     let Some(db) = db.upgrade() else { break };
+                    let _guard = gate.lock().await;
                     if let Err(e) = db.push().await {
                         tracing::debug!("Turso background push failed: {e}");
-                    }
-                    if let Err(e) = db.pull().await {
-                        tracing::debug!("Turso background pull failed: {e}");
                     }
                 }
             });
         }
 
-        Ok(Self { db, conn })
+        Ok(Self { db, conn, gate })
     }
 
     /// Push local changes to the remote. Called by the host on suspend.
     pub async fn push(&self) -> anyhow::Result<()> {
+        let _guard = self.gate.lock().await;
         self.db.push().await?;
         Ok(())
     }
@@ -559,6 +588,7 @@ impl TursoConnection {
         parameters: Vec<sqlite::Value>,
         max_result_bytes: usize,
     ) -> Result<sqlite::QueryResult, sqlite::Error> {
+        let _guard = self.gate.lock().await;
         let rows = self
             .conn
             .query(query, convert_parameters(&parameters))
@@ -583,6 +613,9 @@ impl TursoConnection {
         let (rows_tx, rows_rx) = tokio::sync::mpsc::channel(4);
         let (err_tx, err_rx) = tokio::sync::oneshot::channel();
 
+        // Held for the whole streaming lifetime (moved into the spawned task
+        // below) so no push/other query runs while rows are being drained.
+        let guard = self.gate.clone().lock_owned().await;
         let result = self.conn.query(query, convert_parameters(&parameters)).await;
 
         let mut rows = match result {
@@ -603,6 +636,7 @@ impl TursoConnection {
         let col_count = cols.len();
 
         tokio::spawn(async move {
+            let _guard = guard; // release the gate only when streaming completes
             let work = async {
                 let mut byte_count = 0usize;
                 while let Some(row) = rows.next().await.map_err(io_error_v3)? {
@@ -632,11 +666,13 @@ impl TursoConnection {
     }
 
     async fn execute_batch(&self, statements: &str) -> anyhow::Result<()> {
+        let _guard = self.gate.lock().await;
         self.conn.execute_batch(statements).await?;
         Ok(())
     }
 
     async fn changes(&self) -> u64 {
+        let _guard = self.gate.lock().await;
         // turso::Connection does not expose a `changes()` accessor, so use the
         // SQLite builtin (a `SELECT` does not reset it).
         self.scalar_i64("SELECT changes()")
@@ -645,7 +681,8 @@ impl TursoConnection {
             .max(0) as u64
     }
 
-    fn last_insert_rowid(&self) -> i64 {
+    async fn last_insert_rowid(&self) -> i64 {
+        let _guard = self.gate.lock().await;
         self.conn.last_insert_rowid()
     }
 
