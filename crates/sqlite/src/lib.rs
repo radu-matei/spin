@@ -105,17 +105,8 @@ impl RuntimeConfigResolver {
                 Ok(Arc::new(config.connection_creator()?))
             }
             "turso" => {
-                #[cfg(feature = "turso")]
-                {
-                    let config: TursoDatabase = config.config.try_into()?;
-                    config.connection_creator(&self.local_database_dir)
-                }
-                #[cfg(not(feature = "turso"))]
-                {
-                    anyhow::bail!(
-                        "the 'turso' SQLite backend is not enabled in this build of Spin; rebuild with the `turso` feature"
-                    )
-                }
+                let config: TursoDatabase = config.config.try_into()?;
+                config.connection_creator(&self.local_database_dir)
             }
             _ => anyhow::bail!("Unknown database kind: {database_kind}"),
         }
@@ -213,7 +204,6 @@ impl LibSqlDatabase {
 }
 
 /// How a Turso database provisions its per-instance remote databases.
-#[cfg(feature = "turso")]
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TursoProvision {
@@ -234,7 +224,6 @@ pub enum TursoProvision {
 /// [`spin_factor_sqlite::ConnectionCreator::scoped_to_instance`]), giving each
 /// instance its own local file and remote database, obtained via the configured
 /// provisioner.
-#[cfg(feature = "turso")]
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TursoDatabase {
@@ -269,12 +258,10 @@ pub struct TursoDatabase {
     name_prefix: Option<String>,
 }
 
-#[cfg(feature = "turso")]
 fn default_turso_local_dir() -> PathBuf {
     PathBuf::from("turso-instance-dbs")
 }
 
-#[cfg(feature = "turso")]
 impl TursoDatabase {
     fn connection_creator(self, base_dir: &Path) -> anyhow::Result<Arc<dyn ConnectionCreator>> {
         use spin_sqlite_turso::{

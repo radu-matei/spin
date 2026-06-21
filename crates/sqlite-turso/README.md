@@ -19,14 +19,9 @@ database.
 
 ## Enabling it
 
-The backend is gated behind the `turso` feature so a normal Spin build does not
-pull the (large, beta) Turso dependency:
-
-```bash
-cargo build --features turso          # builds `spin` with the Turso backend
-```
-
-Then select it per database label in your runtime config:
+On this branch the Turso backend is **built into `spin`** — a normal `cargo build`
+includes it (it pulls the large, beta Turso dependency). Select it per database
+label in your runtime config:
 
 ```toml
 # A normal (shared) Turso-synced database:
