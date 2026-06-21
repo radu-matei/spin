@@ -260,13 +260,13 @@ pub struct TursoDatabase {
     org: Option<String>,
     /// Group name (for `provision = "platform"`).
     group: Option<String>,
-    /// Platform API token (for `provision = "platform"`).
+    /// Platform API token, used to create databases (for `provision = "platform"`).
     api_token: Option<String>,
-    /// Sync-URL template with `{db}`/`{org}` placeholders (default
-    /// `libsql://{db}-{org}.turso.io`).
-    url_template: Option<String>,
-    /// Token used to sync to a provisioned database (for `provision = "platform"`).
+    /// Group token used to sync to provisioned databases (authenticates every
+    /// database in the group). If omitted, a db-scoped token is minted per database.
     db_token: Option<String>,
+    /// Prefix prepended to each derived Cloud database name (default `spin-`).
+    name_prefix: Option<String>,
 }
 
 #[cfg(feature = "turso")]
@@ -308,9 +308,8 @@ impl TursoDatabase {
                     .context("provision = \"platform\" requires `group`")?,
                 self.api_token
                     .context("provision = \"platform\" requires `api_token`")?,
-                self.url_template
-                    .unwrap_or_else(|| "libsql://{db}-{org}.turso.io".to_owned()),
                 self.db_token,
+                self.name_prefix.unwrap_or_else(|| "spin-".to_owned()),
             )),
         };
 

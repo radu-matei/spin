@@ -18,7 +18,7 @@
 //!
 //! [Turso]: https://github.com/tursodatabase/turso
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +35,7 @@ use tokio::sync::{Mutex, OnceCell};
 // -----------------------------------------------------------------------------
 
 /// How to reach a (per-instance) remote database.
+#[derive(Clone)]
 pub struct RemoteTarget {
     pub url: String,
     pub token: Option<String>,
@@ -48,11 +49,14 @@ pub trait RemoteProvisioner: Send + Sync {
     async fn ensure(&self, db_name: &str) -> anyhow::Result<RemoteTarget>;
 }
 
-/// Assumes the hosted engine creates the database automatically on first sync
-/// (e.g. a `turso-auto`-style server, or the user's own sync server). Derives the
-/// per-instance URL by appending the database name as a path segment to a base URL.
+/// Targets a **single** remote database at `base_url`.
 ///
-/// This is the default and matches "creation is automatic on sync".
+/// This is the `provision = "auto"` mode, for one local `tursodb --sync-server`
+/// (or any single-database server). It is NOT per-instance: every instance shares
+/// the one remote, because Turso addresses a database by its URL *host*, not a path
+/// — a single-db server has no way to route per-instance. For a remote database
+/// *per* instance, use `provision = "platform"` (Turso Cloud). Local files stay
+/// per-instance regardless.
 pub struct AutoCreateProvisioner {
     pub base_url: String,
     pub token: Option<String>,
@@ -60,96 +64,232 @@ pub struct AutoCreateProvisioner {
 
 #[async_trait]
 impl RemoteProvisioner for AutoCreateProvisioner {
-    async fn ensure(&self, db_name: &str) -> anyhow::Result<RemoteTarget> {
-        let url = if db_name.is_empty() {
-            self.base_url.clone()
-        } else {
-            format!("{}/{}", self.base_url.trim_end_matches('/'), db_name)
-        };
+    async fn ensure(&self, _db_name: &str) -> anyhow::Result<RemoteTarget> {
         Ok(RemoteTarget {
-            url,
+            url: self.base_url.clone(),
             token: self.token.clone(),
         })
     }
 }
 
-/// Provisions a database per instance via the Turso **Platform API** (the same
-/// control plane `turso-auto` uses), for Turso Cloud.
+/// Provisions a database **per instance** via the Turso **Platform API**, for Turso
+/// Cloud. This is the multi-database path: each instance gets its own Cloud
+/// database, addressed by its own hostname.
 ///
-/// The create call is idempotent (an existing database is treated as success). The
-/// resulting sync URL is built from `url_template` (with `{db}`/`{org}`
-/// placeholders) rather than parsed from the response, since the create-response
-/// shape is still beta.
+/// `ensure` creates the database (idempotent), reads its real `Hostname` from the
+/// API response (Cloud hostnames include a region, so a template is unreliable),
+/// and resolves a sync token — a configured group token if set, else a freshly
+/// minted db-scoped token. Results are cached per instance.
 pub struct TursoPlatformProvisioner {
     api_url: String,
     org: String,
     group: String,
+    /// Org/platform token, used to create databases and mint tokens.
     api_token: String,
-    url_template: String,
+    /// Group token used for syncing (authenticates every db in the group). If
+    /// `None`, a db-scoped token is minted per database.
     db_token: Option<String>,
+    /// Prepended to each derived Cloud database name (to namespace within the org).
+    name_prefix: String,
     http: reqwest::Client,
-    provisioned: Mutex<HashSet<String>>,
+    /// instance db name -> resolved sync target.
+    cache: Mutex<HashMap<String, RemoteTarget>>,
 }
 
 impl TursoPlatformProvisioner {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         api_url: String,
         org: String,
         group: String,
         api_token: String,
-        url_template: String,
         db_token: Option<String>,
+        name_prefix: String,
     ) -> Self {
         Self {
             api_url,
             org,
             group,
             api_token,
-            url_template,
             db_token,
+            name_prefix,
             http: reqwest::Client::new(),
-            provisioned: Mutex::new(HashSet::new()),
+            cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn api(&self) -> &str {
+        self.api_url.trim_end_matches('/')
+    }
+
+    /// Create the database if needed (idempotent) and return its hostname.
+    async fn ensure_database(&self, name: &str) -> anyhow::Result<String> {
+        let resp = self
+            .http
+            .post(format!("{}/v1/organizations/{}/databases", self.api(), self.org))
+            .bearer_auth(&self.api_token)
+            .json(&serde_json::json!({ "name": name, "group": self.group }))
+            .send()
+            .await
+            .context("Turso Platform API: create database request failed")?;
+        let status = resp.status();
+        if status.is_success() {
+            return parse_hostname(resp).await;
+        }
+        // 409 (and some deployments 400) == already exists: fetch it instead.
+        if status.as_u16() == 409 || status.as_u16() == 400 {
+            return self.get_database_hostname(name).await;
+        }
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Turso Platform API: creating database '{name}' failed ({status}): {body}");
+    }
+
+    async fn get_database_hostname(&self, name: &str) -> anyhow::Result<String> {
+        let resp = self
+            .http
+            .get(format!("{}/v1/organizations/{}/databases/{}", self.api(), self.org, name))
+            .bearer_auth(&self.api_token)
+            .send()
+            .await
+            .context("Turso Platform API: get database request failed")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Turso Platform API: getting database '{name}' failed ({status}): {body}");
+        }
+        parse_hostname(resp).await
+    }
+
+    async fn mint_token(&self, name: &str) -> anyhow::Result<String> {
+        let resp = self
+            .http
+            .post(format!(
+                "{}/v1/organizations/{}/databases/{}/auth/tokens",
+                self.api(),
+                self.org,
+                name
+            ))
+            .bearer_auth(&self.api_token)
+            .send()
+            .await
+            .context("Turso Platform API: mint token request failed")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Turso Platform API: minting token for '{name}' failed ({status}): {body}");
+        }
+        let v: serde_json::Value = resp.json().await.context("parse token response")?;
+        v.get("jwt")
+            .and_then(|j| j.as_str())
+            .map(|s| s.to_owned())
+            .context("Turso Platform API: token response missing `jwt`")
     }
 }
 
 #[async_trait]
 impl RemoteProvisioner for TursoPlatformProvisioner {
     async fn ensure(&self, db_name: &str) -> anyhow::Result<RemoteTarget> {
-        let name = db_name.to_owned();
-        let already = self.provisioned.lock().await.contains(&name);
-        if !already {
-            let endpoint = format!(
-                "{}/v1/organizations/{}/databases",
-                self.api_url.trim_end_matches('/'),
-                self.org
-            );
-            let resp = self
-                .http
-                .post(&endpoint)
-                .bearer_auth(&self.api_token)
-                .json(&serde_json::json!({ "name": name, "group": self.group }))
-                .send()
-                .await
-                .context("Turso Platform API request failed")?;
-            let status = resp.status();
-            // 409 == already exists, which is fine (idempotent).
-            if !status.is_success() && status.as_u16() != 409 {
-                let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("Turso Platform API: creating database '{name}' failed ({status}): {body}");
-            }
-            self.provisioned.lock().await.insert(name.clone());
+        if let Some(target) = self.cache.lock().await.get(db_name) {
+            return Ok(target.clone());
         }
-        let url = self
-            .url_template
-            .replace("{db}", &name)
-            .replace("{org}", &self.org);
-        Ok(RemoteTarget {
-            url,
-            token: self.db_token.clone(),
-        })
+        let cloud_name = cloud_db_name(&self.name_prefix, db_name);
+        let hostname = self.ensure_database(&cloud_name).await?;
+        let token = match &self.db_token {
+            Some(t) => Some(t.clone()),
+            None => Some(self.mint_token(&cloud_name).await?),
+        };
+        // The crate normalizes `libsql://` to `https://`; the database is addressed
+        // by this hostname.
+        let target = RemoteTarget {
+            url: format!("libsql://{hostname}"),
+            token,
+        };
+        self.cache
+            .lock()
+            .await
+            .insert(db_name.to_owned(), target.clone());
+        Ok(target)
     }
+}
+
+/// Extract the database hostname from a Turso Platform API response, which looks
+/// like `{ "database": { "Name": ..., "Hostname": ... } }`.
+async fn parse_hostname(resp: reqwest::Response) -> anyhow::Result<String> {
+    let v: serde_json::Value = resp.json().await.context("parse database response")?;
+    hostname_from_json(&v).context("Turso Platform API: response missing database hostname")
+}
+
+/// Pull the database hostname out of a (possibly `database`-wrapped) JSON value,
+/// tolerating `Hostname`/`hostname` casing.
+fn hostname_from_json(v: &serde_json::Value) -> Option<String> {
+    let db = v.get("database").unwrap_or(v);
+    ["Hostname", "hostname"]
+        .iter()
+        .find_map(|k| db.get(k).and_then(|h| h.as_str()))
+        .map(|s| s.to_owned())
+}
+
+/// Derive a Turso-Cloud-safe database name from a stateful instance id.
+///
+/// Cloud names are lowercase `[a-z0-9-]`, bounded length, and unique per org. We
+/// build `"{prefix}{slug}-{hash}"`: a lowercased/hyphenated, length-bounded slug of
+/// the id plus a stable hash of the *full* id, so distinct instances never collide
+/// even when the slug is truncated.
+fn cloud_db_name(prefix: &str, id: &str) -> String {
+    const MAX_LEN: usize = 54;
+    const HASH_HEX: usize = 16;
+
+    let hash = stable_hash_hex(id);
+    let slug: String = id
+        .chars()
+        .map(|c| {
+            let c = c.to_ascii_lowercase();
+            if c.is_ascii_alphanumeric() {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let mut slug = collapse_dashes(&slug);
+    let max_slug = MAX_LEN.saturating_sub(prefix.len() + 1 + HASH_HEX);
+    if slug.len() > max_slug {
+        slug.truncate(max_slug);
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        format!("{prefix}{hash}")
+    } else {
+        format!("{prefix}{slug}-{hash}")
+    }
+}
+
+/// Collapse runs of `-` into one.
+fn collapse_dashes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_dash = false;
+    for c in s.chars() {
+        if c == '-' {
+            if !prev_dash {
+                out.push(c);
+            }
+            prev_dash = true;
+        } else {
+            out.push(c);
+            prev_dash = false;
+        }
+    }
+    out
+}
+
+/// FNV-1a 64-bit, hex-encoded. Stable across runs/versions/platforms (unlike
+/// `DefaultHasher`), so an instance always maps to the same Cloud database.
+fn stable_hash_hex(s: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
 }
 
 // -----------------------------------------------------------------------------
@@ -580,4 +720,72 @@ fn io_error(err: turso::Error) -> sqlite::Error {
 
 fn io_error_v3(err: turso::Error) -> v3::Error {
     v3::Error::Io(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn is_valid_cloud_name(s: &str) -> bool {
+        !s.is_empty()
+            && s.len() <= 54
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !s.starts_with('-')
+            && !s.ends_with('-')
+            && !s.contains("--")
+    }
+
+    #[test]
+    fn cloud_name_is_valid_and_stable() {
+        let a = cloud_db_name("spin-", "todo/groceries");
+        let b = cloud_db_name("spin-", "todo/groceries");
+        assert_eq!(a, b, "must be stable across calls");
+        assert!(is_valid_cloud_name(&a), "invalid name: {a}");
+        assert!(a.starts_with("spin-todo-groceries-"));
+    }
+
+    #[test]
+    fn distinct_ids_give_distinct_names() {
+        let a = cloud_db_name("spin-", "todo/groceries");
+        let b = cloud_db_name("spin-", "todo/work");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn long_ids_are_bounded_and_collision_free() {
+        let a = cloud_db_name("spin-", &format!("comp/{}", "x".repeat(200)));
+        let b = cloud_db_name("spin-", &format!("comp/{}", "y".repeat(200)));
+        assert!(a.len() <= 54, "too long: {} ({})", a, a.len());
+        assert!(is_valid_cloud_name(&a), "invalid: {a}");
+        // Same truncated slug, but the hash of the full id differs → no collision.
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn sanitizes_invalid_chars() {
+        let n = cloud_db_name("spin-", "Foo_Bar/Baz!");
+        assert!(is_valid_cloud_name(&n), "invalid: {n}");
+    }
+
+    #[test]
+    fn collapse_dashes_collapses_runs() {
+        assert_eq!(collapse_dashes("a--b---c"), "a-b-c");
+        assert_eq!(collapse_dashes("--x--"), "-x-");
+    }
+
+    #[test]
+    fn parses_hostname_from_platform_response() {
+        let wrapped = serde_json::json!({
+            "database": { "Name": "x", "Hostname": "x-org.aws-us-east-1.turso.io" }
+        });
+        assert_eq!(
+            hostname_from_json(&wrapped).as_deref(),
+            Some("x-org.aws-us-east-1.turso.io")
+        );
+        let flat = serde_json::json!({ "hostname": "y.turso.io" });
+        assert_eq!(hostname_from_json(&flat).as_deref(), Some("y.turso.io"));
+        let missing = serde_json::json!({ "database": { "Name": "x" } });
+        assert_eq!(hostname_from_json(&missing), None);
+    }
 }

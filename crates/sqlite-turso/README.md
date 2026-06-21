@@ -84,32 +84,44 @@ database — which the hosted engine is expected to create on first sync.)
   `Connection::sync()` hook → Turso `push()`), so writes are durable before the
   instance is dropped.
 
-## Provisioning the per-instance remote database
+## Provisioning the remote database (the `provision` config field)
 
-Each instance needs its own remote database. The Turso crate does **not**
-auto-create it, so the backend obtains it through a `RemoteProvisioner` selected
-by the `provision` config field:
+Turso addresses a database by its URL **host** (the database name is the
+subdomain), never by a path. So a server that hosts only one database can't be
+shared per-instance; per-instance remote databases require a multi-tenant server
+(Turso Cloud). The backend obtains each instance's remote via a `RemoteProvisioner`
+selected by `provision`:
 
-- **`provision = "auto"` (default)** — assumes the hosted engine creates the
-  database automatically on first sync (a `turso-auto`-style server, or your own
-  sync server). The per-instance URL is the base `url` with the instance name as a
-  path segment. This matches "creation is automatic on sync".
-- **`provision = "platform"`** — creates each per-instance database via the Turso
-  **Platform API** (`POST /v1/organizations/{org}/databases`, idempotent) for
-  Turso Cloud. Requires `org`, `group`, `api_token`; the sync URL is built from
-  `url_template` (`{db}`/`{org}` placeholders, default
-  `libsql://{db}-{org}.turso.io`).
+- **`provision = "auto"`** — a **single** remote database at the configured `url`,
+  for one local `tursodb --sync-server` (or any single-DB server). This is *not*
+  per-instance — every instance shares the one remote — so use it only for a single
+  instance / smoke tests. (Local files stay per-instance regardless.)
+- **`provision = "platform"`** — the per-instance multi-DB path, on **Turso Cloud**.
+  Each instance gets its own Cloud database: `ensure` creates it via the Platform
+  API (`POST /v1/organizations/{org}/databases`, idempotent), reads the database's
+  real `Hostname` from the response, and syncs to `libsql://{hostname}`. Requires
+  `org`, `group`, `api_token` (org token, to create); `db_token` (a group token to
+  sync — else a db-scoped token is minted per database); optional `name_prefix`
+  (default `spin-`). Cloud database names are derived safely from the instance id
+  (lowercase, length-bounded, with a stable hash so distinct instances never
+  collide).
 
 ## Local testing
 
-Run a local Turso sync server (no Turso Cloud account needed):
+The new Turso sync protocol is served by **`tursodb --sync-server`** — NOT by
+`turso dev` (which is the legacy `sqld`/Hrana server and is **not** compatible
+with this crate's `push`/`pull`). Install the `tursodb` binary at the *same commit*
+as the `turso` crate this backend depends on (so the server and client speak the
+same protocol — see the crate's `.cargo_vcs_info.json` for the sha):
 
 ```bash
-curl -sSfL https://get.turso.tech/install.sh | bash   # installs `turso`/`tursodb`
-turso dev                                              # serves http://127.0.0.1:8080, no auth
+cargo install --git https://github.com/tursodatabase/turso \
+  --rev <sha-of-the-turso-crate-version> --bin tursodb turso_cli
+
+tursodb ./turso-server.db --sync-server 0.0.0.0:8080   # http://127.0.0.1:8080, no auth
 ```
 
-Point the backend at it (no token needed):
+Point the backend at it (single-DB, no token):
 
 ```toml
 [sqlite_database.instance-db]
@@ -119,10 +131,32 @@ url = "http://127.0.0.1:8080"
 sync_interval_seconds = 5
 ```
 
-The local server hosts a **single** database (dynamic per-name creation locally is
-a known open Turso limitation), so locally you can fully exercise **one** instance.
-For multi-instance remote isolation, run one `turso dev` per instance on different
-ports, or use Turso Cloud with `provision = "platform"`.
+One `tursodb --sync-server` process hosts a **single** database, so this only
+exercises **one** instance. There is no open-source local multi-tenant server, so
+per-instance remote databases are tested on **Turso Cloud**.
+
+### Per-instance multi-DB on Turso Cloud
+
+```bash
+turso auth login
+turso auth api-tokens mint spin          # -> api_token (creates databases)
+turso group tokens create default        # -> db_token  (syncs all DBs in the group)
+```
+
+```toml
+[sqlite_database.instance-db]
+type = "turso"
+provision = "platform"
+org = "<your-org>"
+group = "default"
+api_token = "<api_token>"
+db_token = "<group-token>"
+sync_interval_seconds = 5
+# name_prefix = "spin-"   # optional
+```
+
+Each instance then becomes its own Cloud database; `turso db list` shows one per
+`(component, instance)`.
 
 ## Still beta / to verify
 
