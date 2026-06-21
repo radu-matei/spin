@@ -51,6 +51,19 @@ pub struct RemoteTarget {
 #[async_trait]
 pub trait RemoteProvisioner: Send + Sync {
     async fn ensure(&self, db_name: &str) -> anyhow::Result<RemoteTarget>;
+
+    /// A *predicted* sync target derived without creating the remote database, so
+    /// the local synced db can be opened (and written to) before — or in parallel
+    /// with — provisioning. `None` if the provisioner can't derive one (the caller
+    /// then falls back to the blocking [`ensure`]).
+    ///
+    /// When this returns `Some`, the caller opens the local db immediately and is
+    /// expected to call [`ensure`] in the background to actually create the remote
+    /// before pushing. The first (region-lookup) call may touch the network; the
+    /// result is cached so subsequent instances are fully local.
+    async fn predicted(&self, _db_name: &str) -> Option<RemoteTarget> {
+        None
+    }
 }
 
 /// Targets a **single** remote database at `base_url`.
@@ -101,6 +114,9 @@ pub struct TursoPlatformProvisioner {
     http: reqwest::Client,
     /// instance db name -> resolved sync target.
     cache: Mutex<HashMap<String, RemoteTarget>>,
+    /// The group's primary location (region), cached. Used to predict a database's
+    /// hostname (`{db}-{org}.{region}.turso.io`) without creating it.
+    region: OnceCell<String>,
 }
 
 impl TursoPlatformProvisioner {
@@ -121,11 +137,44 @@ impl TursoPlatformProvisioner {
             name_prefix,
             http: reqwest::Client::new(),
             cache: Mutex::new(HashMap::new()),
+            region: OnceCell::new(),
         }
     }
 
     fn api(&self) -> &str {
         self.api_url.trim_end_matches('/')
+    }
+
+    /// The group's primary location (e.g. `aws-eu-west-1`), fetched once and cached.
+    /// All per-instance databases are created in `self.group`, so they share it.
+    async fn region(&self) -> anyhow::Result<&String> {
+        self.region
+            .get_or_try_init(|| async {
+                let resp = self
+                    .http
+                    .get(format!("{}/v1/organizations/{}/groups/{}", self.api(), self.org, self.group))
+                    .bearer_auth(&self.api_token)
+                    .send()
+                    .await
+                    .context("Turso Platform API: get group request failed")?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("Turso Platform API: getting group '{}' failed ({status}): {body}", self.group);
+                }
+                let v: serde_json::Value = resp.json().await.context("parse group response")?;
+                v.get("group")
+                    .and_then(|g| g.get("primary"))
+                    .and_then(|p| p.as_str())
+                    .map(|s| s.to_owned())
+                    .context("Turso Platform API: group response missing `primary` location")
+            })
+            .await
+    }
+
+    /// The hostname Turso Cloud assigns a database: `{db}-{org}.{region}.turso.io`.
+    fn predicted_hostname(&self, cloud_name: &str, region: &str) -> String {
+        format!("{cloud_name}-{}.{region}.turso.io", self.org)
     }
 
     /// Create the database if needed (idempotent) and return its hostname plus
@@ -219,6 +268,29 @@ impl RemoteProvisioner for TursoPlatformProvisioner {
             .await
             .insert(db_name.to_owned(), target.clone());
         Ok(target)
+    }
+
+    async fn predicted(&self, db_name: &str) -> Option<RemoteTarget> {
+        // A predicted target needs a group token (one token authenticates every db
+        // in the group); without it we'd have to mint a db-scoped token, which
+        // requires the database to already exist — so fall back to the blocking path.
+        let token = self.db_token.clone()?;
+        let region = match self.region().await {
+            Ok(r) => r.clone(),
+            Err(e) => {
+                tracing::debug!("Turso region lookup failed; using blocking provisioning: {e:#}");
+                return None;
+            }
+        };
+        let cloud_name = cloud_db_name(&self.name_prefix, db_name);
+        let hostname = self.predicted_hostname(&cloud_name, &region);
+        Some(RemoteTarget {
+            url: format!("libsql://{hostname}"),
+            token: Some(token),
+            // The fast path opens local-first (no bootstrap) regardless; this field
+            // is unused there. `true` keeps the "push-first" reading consistent.
+            created: true,
+        })
     }
 }
 
@@ -494,26 +566,81 @@ async fn build_connection(
     sync_interval: Option<Duration>,
 ) -> anyhow::Result<Arc<TursoConnection>> {
     let local_absent = !local_path.exists();
+
+    // Fast path: open the local synced db against the *predicted* remote URL with
+    // ZERO network on the open (`bootstrap_if_empty(false)`), so the first write is
+    // local-speed and never waits on the (slow) Cloud database creation. The remote
+    // is created/confirmed in the background before the first push.
+    if let Some(target) = provisioner.predicted(&db_name).await {
+        let conn = Arc::new(
+            TursoConnection::create(
+                local_path,
+                target.url.clone(),
+                target.token,
+                sync_interval,
+                /* bootstrap = */ false,
+            )
+            .await
+            .context("failed to open local Turso synced database")?,
+        );
+        spawn_remote_setup(provisioner, db_name, target.url, local_absent, conn.clone());
+        return Ok(conn);
+    }
+
+    // Blocking path (no predicted target): provision first, then open. Bootstrap
+    // (download) only to restore a COLD local replica of a PRE-EXISTING database; a
+    // just-created remote is empty (push-first) and a present local file is already
+    // the source of truth.
     let target = provisioner
         .ensure(&db_name)
         .await
         .context("failed to provision remote Turso database")?;
-    // Bootstrap (download) from the remote only when restoring a COLD local replica
-    // of a PRE-EXISTING database. A just-created remote is empty (push-first), and a
-    // present local file is already the source of truth — bootstrapping either would
-    // block on the network and, against a not-yet-ready new remote, can even drop the
-    // first write (it rebases the fresh local WAL onto the empty remote).
     let bootstrap = local_absent && !target.created;
-    let conn = TursoConnection::create(
-        local_path,
-        target.url,
-        target.token,
-        sync_interval,
-        bootstrap,
-    )
-    .await
-    .context("failed to create Turso synced database")?;
+    let conn = TursoConnection::create(local_path, target.url, target.token, sync_interval, bootstrap)
+        .await
+        .context("failed to create Turso synced database")?;
     Ok(Arc::new(conn))
+}
+
+/// Background work after a fast-path open: create the remote database (so a later
+/// `push` has a target) and, if it turned out to already exist while our local
+/// replica was cold, restore from it.
+fn spawn_remote_setup(
+    provisioner: Arc<dyn RemoteProvisioner>,
+    db_name: String,
+    predicted_url: String,
+    local_absent: bool,
+    conn: Arc<TursoConnection>,
+) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        match provisioner.ensure(&db_name).await {
+            Ok(real) => {
+                if real.url != predicted_url {
+                    tracing::error!(
+                        "Turso predicted URL {predicted_url} != actual {}; background sync may fail",
+                        real.url
+                    );
+                }
+                // Cold local replica of a database that ALREADY existed (and may hold
+                // data): restore it. Safe because a just-opened replica has no local
+                // writes to lose; a brand-new database (created here) has nothing to
+                // pull, and a present local file takes the `local_absent == false`
+                // path. push() of an empty local is a no-op, so the remote is never
+                // clobbered before the restore lands.
+                if local_absent && !real.created {
+                    if let Err(e) = conn.restore().await {
+                        tracing::warn!("Turso cold-replica restore failed: {e:#}");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Turso background remote create failed (push will retry): {e:#}");
+            }
+        }
+    });
 }
 
 #[async_trait]
@@ -656,6 +783,14 @@ impl TursoConnection {
     pub async fn push(&self) -> anyhow::Result<()> {
         let _guard = self.gate.lock().await;
         self.db.push().await?;
+        Ok(())
+    }
+
+    /// Pull remote state into the local replica. Used to restore a cold replica of
+    /// a pre-existing remote database (see [`spawn_remote_setup`]).
+    pub async fn restore(&self) -> anyhow::Result<()> {
+        let _guard = self.gate.lock().await;
+        self.db.pull().await?;
         Ok(())
     }
 
